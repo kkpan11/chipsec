@@ -26,9 +26,9 @@ import hashlib
 import struct
 from typing import Optional, Tuple
 from uuid import UUID
-from chipsec.defines import bytestostring
+from chipsec.library.defines import bytestostring
 from chipsec.hal.uefi_common import get_3b_size, bit_set, align
-from chipsec.logger import logger
+from chipsec.library.logger import logger
 
 ################################################################################################
 #
@@ -307,19 +307,33 @@ def FvChecksum16(buffer: bytes) -> int:
     return ((0x10000 - FvSum16(buffer)) & 0xffff)
 
 
-def ValidateFwVolumeHeader(ZeroVector: str, FsGuid: UUID, FvLength: int, HeaderLength: int, ExtHeaderOffset: int, Reserved: int, size: int, Calcsum: int, Checksum: int) -> bool:
-    fv_rsvd = (Reserved == 0)
-    fv_len = (FvLength <= size)
+def ValidateFwVolumeHeader(FsGuid: UUID, FvLength: int, HeaderLength: int, ExtHeaderOffset: int, Reserved: int,
+                           size: int, Calcsum: int, Checksum: int) -> bool:
+    fv_rsvd = Reserved == 0
+    if not fv_rsvd:
+        logger().log_hal(f'WARNING: Firmware Volume {{{FsGuid}}} header has non-zero reserved values 0b{Reserved:b}')
+
+    fv_len = FvLength <= size
+    if not fv_len:
+        logger().log_hal(f'WARNING: Firmware Volume {{{FsGuid}}} data length 0x{FvLength:X} '
+                         f'exceeds total image length 0x{size:X}')
+
     fv_header_len = (ExtHeaderOffset < FvLength) and (HeaderLength < FvLength)
+    if not fv_header_len:
+        logger().log_hal(f'WARNING: Firmware Volume {{{FsGuid}}} header length 0x{HeaderLength:X} '
+                         f'exceeds or matches volume data length 0x{FvLength:X}')
+
     if Checksum != Calcsum:
-        logger().log_warning(f'Firmware Volume {{{FsGuid}}} checksum does not match calculated checksum')
+        logger().log_hal(f'WARNING: Firmware Volume {{{FsGuid}}} checksum 0x{Checksum:X} '
+                         f'does not match calculated checksum 0x{Calcsum:X}')
+
     return fv_rsvd and fv_len and fv_header_len
 
 
 def NextFwVolume(buffer: bytes, off: int = 0, last_fv_size: int = 0) -> Optional[EFI_FV]:
     fof = off if last_fv_size == 0 else off + max(last_fv_size, EFI_FIRMWARE_VOLUME_HEADER_size)
     size = len(buffer)
-    while ((fof + EFI_FIRMWARE_VOLUME_HEADER_size) < size):
+    while (fof + EFI_FIRMWARE_VOLUME_HEADER_size) < size:
         fof = bytestostring(buffer).find("_FVH", fof)
         if fof == -1 or size - fof < EFI_FIRMWARE_VOLUME_HEADER_size:
             break
@@ -340,8 +354,9 @@ def NextFwVolume(buffer: bytes, off: int = 0, last_fv_size: int = 0) -> Optional
             fvh = fvh + tail
         CalcSum = FvChecksum16(fvh)
         FsGuid = UUID(bytes_le=FileSystemGuid0)
-        if (ValidateFwVolumeHeader(ZeroVector, FsGuid, FvLength, HeaderLength, ExtHeaderOffset, Reserved, size, CalcSum, Checksum)):
-            return EFI_FV(fof, FsGuid, FvLength, Attributes, HeaderLength, Checksum, ExtHeaderOffset, buffer[fof:fof + FvLength], CalcSum)
+        FvImage = buffer[fof:fof + FvLength]
+        if ValidateFwVolumeHeader(FsGuid, FvLength, HeaderLength, ExtHeaderOffset, Reserved, len(FvImage), CalcSum, Checksum):
+            return EFI_FV(fof, FsGuid, FvLength, Attributes, HeaderLength, Checksum, ExtHeaderOffset, FvImage, CalcSum)
         else:
             fof += 0x2C
     return None
@@ -381,10 +396,10 @@ def GetFvHeader(buffer: bytes, off: int = 0) -> Tuple[int, int, int]:
             size = size + (numblocks * lenblock)
         numblocks, lenblock = struct.unpack(EFI_FV_BLOCK_MAP_ENTRY, buffer[fof:fof + EFI_FV_BLOCK_MAP_ENTRY_SZ])
     if FvLength != size:
-        logger().log("ERROR: Volume Size not consistent with Block Maps")
+        logger().log_hal("ERROR: Volume Size not consistent with Block Maps")
         return (0, 0, 0)
     if size >= 0x40000000 or size == 0:
-        logger().log("ERROR: Volume is corrupted")
+        logger().log_hal("ERROR: Volume is corrupted")
         return (0, 0, 0)
     return (size, HeaderLength, Attributes)
 
@@ -425,11 +440,11 @@ def NextFwFile(FvImage: bytes, FvLength: int, fof: int, polarity: bool) -> Optio
 
         # Validate fsize is a legal value
         if fsize == 0 or fsize > FvLength - cur_offset:
-            logger().log("Unable to get correct file size for NextFwFile corrupt header information")
+            logger().log_hal("WARNING: Unable to get correct file size for NextFwFile corrupt header information")
             break
         # Get next_offset
         update_or_deleted = (bit_set(State, EFI_FILE_MARKED_FOR_UPDATE, polarity)) or (bit_set(State, EFI_FILE_DELETED, polarity))
-        if not((bit_set(State, EFI_FILE_DATA_VALID, polarity)) or update_or_deleted):
+        if not ((bit_set(State, EFI_FILE_DATA_VALID, polarity)) or update_or_deleted):
             # else:
             cur_offset = align(cur_offset + 1, 8)
             continue

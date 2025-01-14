@@ -33,10 +33,10 @@ import struct
 import uuid
 from typing import Optional, Tuple
 from chipsec.hal import hal_base
-from chipsec.logger import logger, print_buffer_bytes
+from chipsec.library.logger import logger, print_buffer_bytes
 from chipsec.hal.acpi import ACPI
 from chipsec.hal.acpi_tables import UEFI_TABLE, GAS
-from chipsec.defines import bytestostring
+from chipsec.library.defines import bytestostring
 
 SMI_APMC_PORT = 0xB2
 SMI_DATA_PORT = 0xB3
@@ -62,6 +62,18 @@ class Interrupts(hal_base.HALBase):
         logger().log_hal(f"       RDI = 0x{_rdi:016X}")
         return self.cs.helper.send_sw_smi(thread_id, SMI_code_data, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
 
+    def send_SW_SMI_timed(self, thread_id: int, SMI_code_port_value: int, SMI_data_port_value: int, _rax: int, _rbx: int, _rcx: int, _rdx: int, _rsi: int, _rdi: int) -> Optional[Tuple[int, int, int, int, int, int, int]]:
+        SMI_code_data = (SMI_data_port_value << 8 | SMI_code_port_value)
+        logger().log_hal(
+            f"[intr] Sending SW SMI: code port 0x{SMI_APMC_PORT:02X} <- 0x{SMI_code_port_value:02X}, data port 0x{SMI_APMC_PORT + 1:02X} <- 0x{SMI_data_port_value:02X} (0x{SMI_code_data:04X})")
+        logger().log_hal(f"       RAX = 0x{_rax:016X} (AX will be overridden with values of SW SMI ports B2/B3)")
+        logger().log_hal(f"       RBX = 0x{_rbx:016X}")
+        logger().log_hal(f"       RCX = 0x{_rcx:016X}")
+        logger().log_hal(f"       RDX = 0x{_rdx:016X} (DX will be overridden with 0x00B2)")
+        logger().log_hal(f"       RSI = 0x{_rsi:016X}")
+        logger().log_hal(f"       RDI = 0x{_rdi:016X}")
+        return self.cs.helper.send_sw_smi_timed(thread_id, SMI_code_data, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
+
     def send_SMI_APMC(self, SMI_code_port_value: int, SMI_data_port_value: int) -> None:
         logger().log_hal(f"[intr] sending SMI via APMC ports: code 0xB2 <- 0x{SMI_code_port_value:02X}, data 0xB3 <- 0x{SMI_data_port_value:02X}")
         self.cs.io.write_port_byte(SMI_DATA_PORT, SMI_data_port_value)
@@ -69,8 +81,8 @@ class Interrupts(hal_base.HALBase):
 
     def send_NMI(self) -> None:
         logger().log_hal("[intr] Sending NMI# through TCO1_CTL[NMI_NOW]")
-        reg, ba = self.cs.get_IO_space("TCOBASE")
-        tcobase = self.cs.read_register_field(reg, ba)
+        reg, ba = self.cs.device.get_IO_space("TCOBASE")
+        tcobase = self.cs.register.read_field(reg, ba)
         return self.cs.io.write_port_byte(tcobase + NMI_TCO1_CTL + 1, NMI_NOW)
 
     def find_ACPI_SMI_Buffer(self) -> Optional[UEFI_TABLE.CommBuffInfo]:

@@ -39,7 +39,7 @@ from argparse import ArgumentParser
 
 from chipsec.command import BaseCommand, toLoad
 
-from chipsec.logger import print_buffer_bytes
+from chipsec.library.logger import print_buffer_bytes
 from chipsec.hal.ec import EC
 
 
@@ -57,8 +57,11 @@ class ECCommand(BaseCommand):
         parser_offset = ArgumentParser(add_help=False)
         parser_offset.add_argument('offset', type=lambda x: int(x, 0), nargs='?', default=0, help="offset")
 
-        parser_sz = ArgumentParser(add_help=False)
-        parser_sz.add_argument("size", type=lambda sz: int(sz, 0), nargs='?', help="size")
+        parser_dmpsz = ArgumentParser(add_help=False)
+        parser_dmpsz.add_argument("size", type=lambda sz: int(sz, 0), nargs='?', default=0x160, help="size")
+
+        parser_rdsz = ArgumentParser(add_help=False)
+        parser_rdsz.add_argument("size", type=lambda sz: int(sz, 0), nargs='?', default=None, help="size")
 
         subparsers = parser.add_subparsers()
 
@@ -66,11 +69,11 @@ class ECCommand(BaseCommand):
         parser_command.add_argument("cmd", type=lambda sz: int(sz, 0), help="EC command to issue")
         parser_command.set_defaults(func=self.command)
 
-        parser_dump = subparsers.add_parser('dump', parents=[parser_sz])
-        parser_dump.set_defaults(func=self.dump, size=0x160)
+        parser_dump = subparsers.add_parser('dump', parents=[parser_dmpsz])
+        parser_dump.set_defaults(func=self.dump)
 
-        parser_read = subparsers.add_parser('read', parents=[parser_offset])
-        parser_read.set_defaults(func=self.read, size=None)
+        parser_read = subparsers.add_parser('read', parents=[parser_offset, parser_rdsz])
+        parser_read.set_defaults(func=self.read)
 
         parser_write = subparsers.add_parser('write', parents=[parser_offset])
         parser_write.add_argument("wval", type=lambda sz: int(sz, 0), help="byte value to write into EC memory")
@@ -103,7 +106,7 @@ class ECCommand(BaseCommand):
         else:
             val = self._ec.read_memory(
                 self.offset) if self.offset < 0x100 else self._ec.read_memory_extended(self.offset)
-            self.logger.log(f'[CHIPSEC] EC memory read: offset 0x{self.start_offset:X} = 0x{val:X}')
+            self.logger.log(f'[CHIPSEC] EC memory read: offset 0x{self.offset:X} = 0x{val:X}')
 
     def write(self) -> None:
         self.logger.log(f'[CHIPSEC] EC memory write: offset 0x{self.offset:X} = 0x{self.wval:X}')

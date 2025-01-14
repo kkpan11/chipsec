@@ -40,7 +40,7 @@ Examples:
 from chipsec.command import BaseCommand, toLoad
 from chipsec.hal import acpi, iommu
 from argparse import ArgumentParser
-from chipsec.exceptions import IOMMUError, AcpiRuntimeError
+from chipsec.library.exceptions import IOMMUError, AcpiRuntimeError
 
 
 # I/O Memory Management Unit (IOMMU), e.g. Intel VT-d
@@ -88,7 +88,7 @@ class IOMMUCommand(BaseCommand):
         try:
             _iommu = iommu.IOMMU(self.cs)
         except IOMMUError as msg:
-            print(msg)
+            self.logger.log(msg)
             return
 
         if self.engine:
@@ -104,7 +104,7 @@ class IOMMUCommand(BaseCommand):
             try:
                 _acpi = acpi.ACPI(self.cs)
             except AcpiRuntimeError as msg:
-                print(msg)
+                self.logger.log(msg)
                 return
 
             if _acpi.is_ACPI_table_present(acpi.ACPI_TABLE_SIG_DMAR):

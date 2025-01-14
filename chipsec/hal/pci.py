@@ -40,11 +40,11 @@ import struct
 from collections import namedtuple
 import itertools
 from typing import List, Tuple, Optional
-from chipsec.logger import logger, pretty_print_hex_buffer
-from chipsec.file import write_file
+from chipsec.library.logger import logger, pretty_print_hex_buffer
+from chipsec.library.file import write_file
 from chipsec.hal.pcidb import VENDORS, DEVICES
-from chipsec.exceptions import OsHelperError
-from chipsec.defines import is_all_ones, MASK_16b, MASK_32b, MASK_64b, BOUNDARY_4KB
+from chipsec.library.exceptions import OsHelperError
+from chipsec.library.defines import is_all_ones, MASK_16b, MASK_32b, MASK_64b, BOUNDARY_4KB
 
 #
 # PCI configuration header registers
@@ -214,7 +214,7 @@ def get_device_name_by_didvid(vid: int, did: int) -> str:
     return ''
 
 
-def print_pci_devices(_devices: List[Tuple[int, int, int, int, int]]) -> None:
+def print_pci_devices(_devices: List[Tuple[int, int, int, int, int, int]]) -> None:
     logger().log("BDF     | VID:DID   | Vendor                       | Device")
     logger().log("-------------------------------------------------------------------------")
     for (b, d, f, vid, did, _) in _devices:
@@ -237,6 +237,7 @@ class Pci:
     def __init__(self, cs):
         self.cs = cs
         self.helper = cs.helper
+        self.hal_log_every_read = True
 
     #
     # Access to PCI configuration registers
@@ -244,17 +245,20 @@ class Pci:
 
     def read_dword(self, bus: int, device: int, function: int, address: int) -> int:
         value = self.helper.read_pci_reg(bus, device, function, address, 4)
-        logger().log_hal(f'[pci] reading B/D/F: {bus:d}/{device:d}/{function:d}, offset: 0x{address:02X}, value: 0x{value:08X}')
+        if self.hal_log_every_read or value != 0xFFFFFFFF:
+            logger().log_hal(f'[pci] reading B/D/F: {bus:d}/{device:d}/{function:d}, offset: 0x{address:02X}, value: 0x{value:08X}')
         return value
 
     def read_word(self, bus: int, device: int, function: int, address: int) -> int:
         word_value = self.helper.read_pci_reg(bus, device, function, address, 2)
-        logger().log_hal(f'[pci] reading B/D/F: {bus:d}/{device:d}/{function:d}, offset: 0x{address:02X}, value: 0x{word_value:04X}')
+        if self.hal_log_every_read or word_value != 0xFFFF:
+            logger().log_hal(f'[pci] reading B/D/F: {bus:d}/{device:d}/{function:d}, offset: 0x{address:02X}, value: 0x{word_value:04X}')
         return word_value
 
     def read_byte(self, bus: int, device: int, function: int, address: int) -> int:
         byte_value = self.helper.read_pci_reg(bus, device, function, address, 1)
-        logger().log_hal(f'[pci] reading B/D/F: {bus:d}/{device:d}/{function:d}, offset: 0x{address:02X}, value: 0x{byte_value:02X}')
+        if self.hal_log_every_read or byte_value != 0xFF:
+            logger().log_hal(f'[pci] reading B/D/F: {bus:d}/{device:d}/{function:d}, offset: 0x{address:02X}, value: 0x{byte_value:02X}')
         return byte_value
 
     def write_byte(self, bus: int, device: int, function: int, address: int, byte_value: int) -> None:
@@ -278,7 +282,7 @@ class Pci:
 
     def enumerate_devices(self, bus: Optional[int] = None, device: Optional[int] = None, function: Optional[int] = None, spec: Optional[bool] = True) -> List[Tuple[int, int, int, int, int, int]]:
         devices = []
-
+        self.hal_log_every_read = False
         if bus is not None:
             bus_range = [bus]
         else:
@@ -304,7 +308,8 @@ class Pci:
                     elif f == 0 and spec:
                         break
                 except OsHelperError:
-                    self.logger.log_hal(f"[pci] unable to access B/D/F: {b:d}/{d:d}/{f:d}")
+                    logger().log_hal(f"[pci] unable to access B/D/F: {b:d}/{d:d}/{f:d}")
+        self.hal_log_every_read = True
         return devices
 
     def dump_pci_config(self, bus: int, device: int, function: int) -> List[int]:
@@ -417,23 +422,23 @@ class Pci:
     #
     # Calculates actual size of MMIO BAR range
     def calc_bar_size(self, bus: int, dev: int, fun: int, off: int, is64: bool, isMMIO: bool) -> int:
-        self.logger.log_hal(f'calc_bar_size {bus}:{dev}.{fun} offset{off}')
+        logger().log_hal(f'calc_bar_size {bus}:{dev}.{fun} offset{off}')
         # Read the original value of the register
         orig_regL = self.read_dword(bus, dev, fun, off)
-        self.logger.log_hal(f'orig_regL: {orig_regL:X}')
+        logger().log_hal(f'orig_regL: {orig_regL:X}')
         if is64:
             orig_regH = self.read_dword(bus, dev, fun, off + PCI_HDR_BAR_STEP)
-            self.logger.log_hal(f'orig_regH: {orig_regH:X}')
+            logger().log_hal(f'orig_regH: {orig_regH:X}')
         # Write all 1's to the register
         self.write_dword(bus, dev, fun, off + PCI_HDR_BAR_STEP, MASK_32b)
         if is64:
             self.write_dword(bus, dev, fun, off, MASK_32b)
         # Read the register back
         regL = self.read_dword(bus, dev, fun, off)
-        self.logger.log_hal(f'regL: {regL:X}')
+        logger().log_hal(f'regL: {regL:X}')
         if is64:
             regH = self.read_dword(bus, dev, fun, off + PCI_HDR_BAR_STEP)
-            self.logger.log_hal(f'regH: {regH:X}')
+            logger().log_hal(f'regH: {regH:X}')
         # Write original value back to register
         self.write_dword(bus, dev, fun, off, orig_regL)
         if is64:

@@ -42,7 +42,8 @@ Registers used:
 
 """
 
-from chipsec.module_common import BaseModule, ModuleResult, MTAG_BIOS, MTAG_SMM
+from chipsec.module_common import BaseModule, MTAG_BIOS, MTAG_SMM
+from chipsec.library.returncode import ModuleResult
 from typing import List
 
 
@@ -53,93 +54,78 @@ class bios_smi(BaseModule):
 
     def __init__(self):
         BaseModule.__init__(self)
-        self.rc_res = ModuleResult(0x744c3dc, 'https://chipsec.github.io/modules/chipsec.modules.common.bios_smi.html')
 
     def is_supported(self) -> bool:
-        if not self.cs.is_control_defined('SmmBiosWriteProtection') or \
-           not self.cs.is_control_defined('TCOSMILock') or \
-           not self.cs.is_control_defined('SMILock') or \
-           not self.cs.is_control_defined('BiosWriteEnable'):
-            self.rc_res.setStatusBit(self.rc_res.status.NOT_APPLICABLE)
-            self.res = self.rc_res.getReturnCode(ModuleResult.NOTAPPLICABLE)
+        if not self.cs.control.is_defined('SmmBiosWriteProtection') or \
+           not self.cs.control.is_defined('TCOSMILock') or \
+           not self.cs.control.is_defined('SMILock') or \
+           not self.cs.control.is_defined('BiosWriteEnable'):
             self.logger.log_important('Required controls not defined for platform.  Skipping module.')
             return False
         return True
 
     def check_SMI_locks(self) -> int:
 
-        #
-        # Checking SMM_BWP first in BIOS control to warn if SMM write-protection of the BIOS is not enabled
-        #
-        smm_bwp = self.cs.get_control('SmmBiosWriteProtection')
+        smm_bwp = self.cs.control.get('SmmBiosWriteProtection')
         if 0 == smm_bwp:
-            self.logger.log_bad("SMM BIOS region write protection has not been enabled (SMM_BWP is not used)\n")
+            self.logger.log_bad('SMM BIOS region write protection has not been enabled (SMM_BWP is not used)\n')
         else:
-            self.logger.log_good("SMM BIOS region write protection is enabled (SMM_BWP is used)\n")
+            self.logger.log_good('SMM BIOS region write protection is enabled (SMM_BWP is used)\n')
 
         ok = True
         warn = False
 
-        #
-        # Checking if global SMI and TCO SMI are enabled (GBL_SMI_EN and TCO_EN bits in SMI_EN register)
-        #
-        if self.cs.is_control_defined('TCOSMIEnable') and self.cs.is_control_defined('GlobalSMIEnable'):
-            self.logger.log("[*] Checking SMI enables..")
-            tco_en = self.cs.get_control('TCOSMIEnable')
-            gbl_smi_en = self.cs.get_control('GlobalSMIEnable')
-            self.logger.log(f"    Global SMI enable: {gbl_smi_en:d}")
-            self.logger.log(f"    TCO SMI enable   : {tco_en:d}")
+        if self.cs.control.is_defined('TCOSMIEnable') and self.cs.control.is_defined('GlobalSMIEnable'):
+            self.logger.log('[*] Checking SMI enables..')
+            tco_en = self.cs.control.get('TCOSMIEnable')
+            gbl_smi_en = self.cs.control.get('GlobalSMIEnable')
+            self.logger.log(f'    Global SMI enable: {gbl_smi_en:d}')
+            self.logger.log(f'    TCO SMI enable   : {tco_en:d}')
 
             if gbl_smi_en != 1:
                 ok = False
-                self.logger.log_bad("Global SMI is not enabled")
+                self.logger.log_bad('Global SMI is not enabled')
             elif (tco_en != 1) and (smm_bwp != 1):
                 warn = True
-                self.logger.log_warning("TCO SMI is not enabled. BIOS may not be using it")
+                self.logger.log_warning('TCO SMI is not enabled. BIOS may not be using it')
             elif (tco_en != 1) and (smm_bwp == 1):
                 ok = False
-                self.logger.log_bad("TCO SMI should be enabled if using SMM BIOS region protection")
+                self.logger.log_bad('TCO SMI should be enabled if using SMM BIOS region protection')
             else:
-                self.logger.log_good("All required SMI events are enabled")
+                self.logger.log_good('All required SMI events are enabled')
             self.logger.log('')
-            self.logger.log("[*] Checking SMI configuration locks..")
+            self.logger.log('[*] Checking SMI configuration locks..')
 
-        #
-        # Checking TCO_LOCK
-        #
-        tco_lock = self.cs.get_control('TCOSMILock')
+        tco_lock = self.cs.control.get('TCOSMILock')
         if tco_lock != 1:
             ok = False
-            self.logger.log_bad("TCO SMI event configuration is not locked. TCO SMI events can be disabled")
+            self.logger.log_bad('TCO SMI event configuration is not locked. TCO SMI events can be disabled')
         else:
-            self.logger.log_good("TCO SMI configuration is locked (TCO SMI Lock)")
+            self.logger.log_good('TCO SMI configuration is locked (TCO SMI Lock)')
 
-        #
-        # Checking SMI_LOCK
-        #
-        smi_lock = self.cs.get_control('SMILock')
+        smi_lock = self.cs.control.get('SMILock')
         if smi_lock != 1:
             ok = False
-            self.logger.log_bad("SMI events global configuration is not locked. SMI events can be disabled")
+            self.logger.log_bad('SMI events global configuration is not locked. SMI events can be disabled')
         else:
-            self.logger.log_good("SMI events global configuration is locked (SMI Lock)")
+            self.logger.log_good('SMI events global configuration is locked (SMI Lock)')
         self.logger.log('')
 
         if ok and not warn:
             res = ModuleResult.PASSED
-            self.logger.log_passed("All required SMI sources seem to be enabled and locked")
+            self.logger.log_passed('All required SMI sources seem to be enabled and locked')
         elif ok and warn:
             res = ModuleResult.WARNING
-            self.rc_res.setStatusBit(self.rc_res.status.VERIFY)
-            self.logger.log_warning("One or more warnings detected when checking SMI enable state")
+            self.result.setStatusBit(self.result.status.VERIFY)
+            self.logger.log_warning('One or more warnings detected when checking SMI enable state')
         else:
             res = ModuleResult.FAILED
-            self.rc_res.setStatusBit(self.rc_res.status.LOCKS)
-            self.logger.log_failed("Not all required SMI sources are enabled and locked")
-        
-        return self.rc_res.getReturnCode(res)
+            self.result.setStatusBit(self.result.status.LOCKS)
+            self.logger.log_failed('Not all required SMI sources are enabled and locked')
+
+        return self.result.getReturnCode(res)
 
     def run(self, module_argv: List[str]) -> int:
-        self.logger.start_test("SMI Events Configuration")
+        self.logger.start_test('SMI Events Configuration')
         self.res = self.check_SMI_locks()
         return self.res

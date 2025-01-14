@@ -29,34 +29,28 @@ import importlib
 import os
 import sys
 from time import time
+from typing import Optional, Dict, Any, Sequence
 
-from typing import Sequence, Optional, Dict, Any
 from chipsec.helper.oshelper import helper
-from chipsec.logger import logger, level
-from chipsec.banner import print_banner, print_banner_properties
-from chipsec.exceptions import UnknownChipsetError
+from chipsec.library.logger import logger, level
+from chipsec.library.banner import print_banner, print_banner_properties
+from chipsec.library.exceptions import UnknownChipsetError
+from chipsec.library.options import Options
 from chipsec.testcase import ExitCode
 from chipsec.chipset import cs
-from chipsec.file import get_main_dir
-from chipsec.defines import get_version, get_message, os_version
+from chipsec.library.file import get_main_dir
+from chipsec.library.defines import get_version, get_message, os_version
 
-CMD_OPTS_WIDTH = ['byte', 'word', 'dword']
+CMD_OPTS_WIDTH = {'byte': 0x1, 'word': 0x2, 'dword': 0x4}
 
 
 def is_option_valid_width(width_op):
-    return (width_op.lower() in CMD_OPTS_WIDTH)
+    return (width_op.lower() in CMD_OPTS_WIDTH.keys())
 
 
 def get_option_width(width_op):
     width_op = width_op.lower()
-    if 'byte' == width_op:
-        return 0x1
-    elif 'word' == width_op:
-        return 0x2
-    elif 'dword' == width_op:
-        return 0x4
-    else:
-        return 0x0
+    return CMD_OPTS_WIDTH.get(width_op, 0)
 
 
 def import_cmds() -> Dict[str, Any]:
@@ -66,12 +60,12 @@ def import_cmds() -> Dict[str, Any]:
 
     if logger().DEBUG:
         logger().log('[CHIPSEC] Loaded command-line extensions:')
-        logger().log('   {}'.format(cmds))
+        logger().log(f'   {cmds}')
     module = None
     commands = {}
     for cmd in cmds:
         try:
-            cmd_path = 'chipsec.utilcmd.' + cmd
+            cmd_path = f'chipsec.utilcmd.{cmd}'
             module = importlib.import_module(cmd_path)
             cu = getattr(module, 'commands')
             commands.update(cu)
@@ -85,6 +79,9 @@ def import_cmds() -> Dict[str, Any]:
 
 def parse_args(argv: Sequence[str]) -> Optional[Dict[str, Any]]:
     """Parse the arguments provided on the command line."""
+    options = Options()
+
+    default_helper = options.get_section_data('Util_Config', 'default_helper', None)
     global_usage = "Additional arguments for specific command.\n\n All numeric values are in hex\n<width> is in {1, byte, 2, word, 4, dword}\n\n"
     cmds = import_cmds()
     parser = argparse.ArgumentParser(usage='%(prog)s [options] <command>', add_help=False)
@@ -101,13 +98,13 @@ def parse_args(argv: Sequence[str]) -> Optional[Dict[str, Any]]:
                          help="Chipsec won't need kernel mode functions so don't load chipsec driver")
     options.add_argument('-i', '--ignore_platform', dest='_ignore_platform', action='store_true',
                          help='Run chipsec even if the platform is not recognized (Deprecated)')
-    options.add_argument('--helper', dest='_helper', help='Specify OS Helper', choices=helper().get_available_helpers())
+    options.add_argument('--helper', dest='_helper', help='Specify OS Helper', choices=helper().get_available_helpers(), default=default_helper)
     options.add_argument('-nb', '--no_banner', dest='_show_banner', action='store_false', help="Chipsec won't display banner information")
     options.add_argument('--skip_config', dest='_load_config', action='store_false', help='Skip configuration and driver loading')
     options.add_argument('-nl', dest='_autolog_disable', action='store_true', help="Chipsec won't save logs automatically")
     options.add_argument('-rc', dest='_return_codes', help='Return codes mode', action='store_true')
     options.add_argument('_cmd', metavar='Command', nargs='?', choices=sorted(cmds.keys()), type=str.lower, default="help",
-                         help="Util command to run: {{{}}}".format(','.join(sorted(cmds.keys()))))
+                         help=f"Util command to run: {{{','.join(sorted(cmds.keys()))}}}")
     options.add_argument('_cmd_args', metavar='Command Args', nargs=argparse.REMAINDER, help=global_usage)
     par = vars(parser.parse_args(argv))
 
@@ -133,17 +130,7 @@ class ChipsecUtil:
         self._cs = cs()
 
     def parse_switches(self) -> None:
-        if self.verbose:
-            self.logger.VERBOSE = True
-        if self.hal:
-            self.logger.HAL = True
-        if self.debug:
-            self.logger.DEBUG = True
-        if self.vverbose:
-            self.logger.VERBOSE = True
-            self.logger.DEBUG = True
-            self.logger.HAL = True
-        self.logger.setlevel()
+        self.logger.set_log_level(self.verbose, self.hal, self.debug, self.vverbose)
         if self.log:
             self.logger.set_log_file(self.log)
             self._autolog_disable = True
@@ -179,7 +166,7 @@ class ChipsecUtil:
         try:
             self._cs.init(self._platform, self._pch, self._helper, reqs.load_driver(), reqs.load_config(), self._ignore_platform)
         except UnknownChipsetError as msg:
-            self.logger.log_error("Platform is not supported ({}).".format(str(msg)))
+            self.logger.log_error(f'Platform is not supported ({str(msg)}).')
             self.logger.log_error('To specify a cpu please use -p command-line option')
             self.logger.log_error('To specify a pch please use --pch command-line option\n')
             self.logger.log_error('If the correct configuration is not loaded, results should not be trusted.')
@@ -200,7 +187,8 @@ class ChipsecUtil:
             return
         
         t = time()
-        comm.run()
+        if comm.prerun():
+            comm.run()
         self.logger.log(f"[CHIPSEC] Time elapsed {time()-t:.3f}")
         
         comm.tear_down()

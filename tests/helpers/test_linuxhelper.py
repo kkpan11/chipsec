@@ -24,7 +24,7 @@ from unittest.mock import patch, Mock
 from multiprocessing import cpu_count
 import sys
 
-from chipsec.exceptions import UnimplementedAPIError
+from chipsec.library.exceptions import UnimplementedAPIError
 from tests.helpers.helper_utils import packer
 
 # assuming 64 bit system. Will break on 32bit system. (would need to swap Q > I in pack())
@@ -246,9 +246,6 @@ class LinuxHelperTest(unittest.TestCase):
     def test_write_mmio_reg(self, _, lh_ioctl):
         lh_ioctl.side_effect = LinuxHelperTest.ioctlret
         self.lhelper.write_mmio_reg(0x123,0x1, 0x22)
-    
-    def test_get_ACPI_SDT(self, _, lh_ioctl):
-        self.assertRaises(UnimplementedAPIError, self.lhelper.get_ACPI_SDT)
 
     def test_get_ACPI_table(self, _, lh_ioctl):
         self.assertRaises(UnimplementedAPIError, self.lhelper.get_ACPI_table, "SDEV")

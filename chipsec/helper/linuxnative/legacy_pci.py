@@ -27,10 +27,10 @@
 
 
 import mmap
+from collections.abc import Callable
 from ctypes import CDLL, CFUNCTYPE, addressof, c_uint16, c_uint32, c_void_p, get_errno
-from typing import Callable
 
-from chipsec.exceptions import OsHelperError
+from chipsec.library.exceptions import OsHelperError
 
 IN_PORT = bytes((
     0x55,                   # push   %rbp

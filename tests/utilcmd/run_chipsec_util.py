@@ -20,10 +20,11 @@
 
 
 from unittest.mock import Mock
-
+from typing import Tuple, List
 import chipsec.helper.replay.replayhelper as rph
 from chipsec_util import ChipsecUtil, parse_args
-import chipsec.logger
+import chipsec.library.logger
+
 
 
 def run_chipsec_util(csu: ChipsecUtil, util_replay_file: str) -> int:
@@ -38,9 +39,12 @@ def run_chipsec_util(csu: ChipsecUtil, util_replay_file: str) -> int:
     comm.tear_down()
     return comm.ExitCode
 
-def setup_run_destroy_util(init_replay_file: str, util_name: str, util_args: str = "", util_replay_file: str = "") -> int:
-    chipsec.logger._logger.remove_chipsec_logger()
-    chipsec.logger._logger = Mock()
+def setup_run_destroy_util_get_log_output(init_replay_file: str, util_name: str, util_args: str = "", util_replay_file: str = "", logging_fucntions_to_capture: List = ['log']) -> Tuple[int, str]:
+    chipsec.library.logger._logger.remove_chipsec_logger()
+    chipsec.library.logger._logger = Mock()
+    chipsec.library.logger._logger.VERBOSE = False
+    chipsec.library.logger._logger.DEBUG = False
+    chipsec.library.logger._logger.HAL = False
     arg_str = f" {util_args}" if util_args else ""
     cli_cmds = f"{util_name}{arg_str}".strip().split(' ')
     par = parse_args(cli_cmds)
@@ -48,5 +52,13 @@ def setup_run_destroy_util(init_replay_file: str, util_name: str, util_args: str
     replayHelper = rph.ReplayHelper(init_replay_file)
     csu._helper = replayHelper
     retval = run_chipsec_util(csu, util_replay_file)
-    chipsec.logger._logger = chipsec.logger.Logger()
+    logger_calls = []
+    for func in logging_fucntions_to_capture:
+        if hasattr(chipsec.library.logger._logger, func):
+            logger_calls += getattr(chipsec.library.logger._logger, func).mock_calls
+    chipsec.library.logger._logger = chipsec.library.logger.Logger()
+    return retval, " ".join([call.args[0] for call in logger_calls])
+
+def setup_run_destroy_util(init_replay_file: str, util_name: str, util_args: str = "", util_replay_file: str = "") -> int:
+    retval, _ = setup_run_destroy_util_get_log_output(init_replay_file,util_name, util_args, util_replay_file)    
     return retval

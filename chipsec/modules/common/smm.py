@@ -37,7 +37,8 @@ Examples:
 This module will only run on client (core) platforms that have PCI0.0.0_SMRAMC defined.
 """
 
-from chipsec.module_common import BaseModule, ModuleResult, MTAG_BIOS, MTAG_SMM
+from chipsec.module_common import BaseModule, MTAG_BIOS, MTAG_SMM
+from chipsec.library.returncode import ModuleResult
 from typing import List
 
 TAGS = [MTAG_BIOS, MTAG_SMM]
@@ -47,47 +48,39 @@ class smm(BaseModule):
 
     def __init__(self):
         BaseModule.__init__(self)
-        self.rc_res = ModuleResult(0x3486891, 'https://chipsec.github.io/modules/chipsec.modules.common.smm.html')
 
     def is_supported(self) -> bool:
-        if self.cs.is_core() and self.cs.is_register_defined('PCI0.0.0_SMRAMC'):
+        if self.cs.is_core() and self.cs.register.is_defined('PCI0.0.0_SMRAMC'):
             return True
         self.logger.log("Either not a Core (client) platform or 'PCI0.0.0_SMRAMC' not defined for platform. Skipping module.")
-        self.rc_res.setStatusBit(self.rc_res.status.NOT_APPLICABLE)
-        self.res = self.rc_res.getReturnCode(ModuleResult.NOTAPPLICABLE)
         return False
 
     def check_SMRAMC(self) -> int:
 
-        regval = self.cs.read_register('PCI0.0.0_SMRAMC')
-        g_smrame = self.cs.get_register_field('PCI0.0.0_SMRAMC', regval, 'G_SMRAME')
-        d_open = self.cs.get_register_field('PCI0.0.0_SMRAMC', regval, 'D_OPEN')
-        d_lock = self.cs.get_register_field('PCI0.0.0_SMRAMC', regval, 'D_LCK')
+        regval = self.cs.register.read('PCI0.0.0_SMRAMC')
+        g_smrame = self.cs.register.get_field('PCI0.0.0_SMRAMC', regval, 'G_SMRAME')
+        d_open = self.cs.register.get_field('PCI0.0.0_SMRAMC', regval, 'D_OPEN')
+        d_lock = self.cs.register.get_field('PCI0.0.0_SMRAMC', regval, 'D_LCK')
 
-        self.cs.print_register('PCI0.0.0_SMRAMC', regval)
+        self.cs.register.print('PCI0.0.0_SMRAMC', regval)
 
         if 1 == g_smrame:
-            self.logger.log("[*] Compatible SMRAM is enabled")
-            # When D_LCK is set HW clears D_OPEN so generally no need to check for D_OPEN but doesn't hurt double checking
+            self.logger.log('[*] Compatible SMRAM is enabled')
             if (1 == d_lock) and (0 == d_open):
                 res = ModuleResult.PASSED
-                self.logger.log_passed("Compatible SMRAM is locked down")
+                self.logger.log_passed('Compatible SMRAM is locked down')
             else:
                 res = ModuleResult.FAILED
-                self.logger.log_failed("Compatible SMRAM is not properly locked. Expected ( D_LCK = 1, D_OPEN = 0 )")
-                self.rc_res.setStatusBit(self.rc_res.status.LOCKS)
+                self.logger.log_failed('Compatible SMRAM is not properly locked. Expected ( D_LCK = 1, D_OPEN = 0 )')
+                self.result.setStatusBit(self.result.status.LOCKS)
         else:
             res = ModuleResult.NOTAPPLICABLE
-            self.rc_res.setStatusBit(self.rc_res.status.FEATURE_DISABLED)
-            self.logger.log("[*] Compatible SMRAM is not enabled. Skipping..")
+            self.result.setStatusBit(self.result.status.FEATURE_DISABLED)
+            self.logger.log('[*] Compatible SMRAM is not enabled. Skipping..')
 
-        return self.rc_res.getReturnCode(res)
+        return self.result.getReturnCode(res)
 
-    # --------------------------------------------------------------------------
-    # run( module_argv )
-    # Required function: run here all tests from this module
-    # --------------------------------------------------------------------------
     def run(self, module_argv: List[str]) -> int:
-        self.logger.start_test("Compatible SMM memory (SMRAM) Protection")
+        self.logger.start_test('Compatible SMM memory (SMRAM) Protection')
         self.res = self.check_SMRAMC()
         return self.res

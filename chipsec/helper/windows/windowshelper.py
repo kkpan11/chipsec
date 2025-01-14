@@ -45,11 +45,11 @@ from win32.lib import win32con
 if TYPE_CHECKING:
     from pywintypes import PyHANDLE
 
-from chipsec.exceptions import OsHelperError, HWAccessViolationError, UnimplementedAPIError
+from chipsec.library.exceptions import OsHelperError, HWAccessViolationError, UnimplementedAPIError
 from chipsec.helper.basehelper import Helper
-from chipsec.defines import stringtobytes, bytestostring
-from chipsec.logger import logger
-import chipsec.file
+from chipsec.library.defines import stringtobytes, bytestostring
+from chipsec.library.logger import logger
+import chipsec.library.file
 from chipsec.hal.uefi_common import EFI_GUID_STR
 
 
@@ -65,7 +65,7 @@ kernel32 = windll.kernel32
 
 drv_hndl_error_msg = "Cannot open chipsec driver handle. Make sure chipsec driver is installed and started if you are using option -e (see README)"
 
-DRIVER_FILE_PATHS = [os.path.join("C:\\", "Windows", "System32", "drivers"), os.path.join(chipsec.file.get_main_dir(), "chipsec", "helper", "windows", f'windows_{platform.machine().lower()}')]
+DRIVER_FILE_PATHS = [os.path.join("C:\\", "Windows", "System32", "drivers"), os.path.join(chipsec.library.file.get_main_dir(), "chipsec", "helper", "windows", f'windows_{platform.machine().lower()}')]
 DRIVER_FILE_NAME = "chipsec_hlpr.sys"
 DEVICE_FILE = "\\\\.\\chipsec_hlpr"
 SERVICE_NAME = "chipsec"
@@ -407,13 +407,14 @@ class WindowsHelper(Helper):
             except pywintypes.error as err:
                 _handle_error(f"Service '{SERVICE_NAME}' didn't start: {err.args[2]} ({err.args[0]:d})", err.args[0])
         self.driverpath = win32serviceutil.LocateSpecificServiceExe(SERVICE_NAME)
+        self.driverpath = f'({self.driverpath})'
         return True
 
     def stop(self) -> bool:
         if self.use_existing_service:
             return True
 
-        logger().log_debug("[helper] Stopping service '{SERVICE_NAME}'...")
+        logger().log_debug(f"[helper] Stopping service '{SERVICE_NAME}'...")
         try:
             win32api.CloseHandle(self.driver_handle)
             self.driver_handle = None
@@ -443,13 +444,13 @@ class WindowsHelper(Helper):
             logger().log_warning(f"Cannot delete service '{SERVICE_NAME}' (not stopped)")
             return False
 
-        logger().log_debug("[helper] Deleting service '{SERVICE_NAME}'...")
+        logger().log_debug(f"[helper] Deleting service '{SERVICE_NAME}'...")
         try:
             win32serviceutil.RemoveService(SERVICE_NAME)
-            logger().log_debug("[helper] Service '{SERVICE_NAME}' deleted")
+            logger().log_debug(f"[helper] Service '{SERVICE_NAME}' deleted")
         except win32service.error as err:
             if logger().DEBUG:
-                logger().log_warning("RemoveService failed: {err.args[2]} ({err.args[0]:d})")
+                logger().log_warning(f"RemoveService failed: {err.args[2]} ({err.args[0]:d})")
             return False
 
         return True
@@ -521,12 +522,12 @@ class WindowsHelper(Helper):
         out_buf = self._ioctl(IOCTL_READ_PHYSMEM, in_buf, out_length)
         return bytes(out_buf)
 
-    def write_phys_mem(self, phys_address: int, length: int, buf: AnyStr):
+    def write_phys_mem(self, phys_address: int, length: int, buf: AnyStr) -> int:
         hi = (phys_address >> 32) & 0xFFFFFFFF
         lo = phys_address & 0xFFFFFFFF
         in_buf = struct.pack('3I', hi, lo, length) + stringtobytes(buf)
         out_buf = self._ioctl(IOCTL_WRITE_PHYSMEM, in_buf, 4)
-        return out_buf
+        return int.from_bytes(out_buf, 'little')
 
     # @TODO: Temporarily the same as read_phys_mem for compatibility
     def read_mmio_reg(self, phys_address: int, size: int) -> int:
@@ -559,7 +560,7 @@ class WindowsHelper(Helper):
             return False
         in_buf = struct.pack('3I', ((phys_address >> 32) & 0xFFFFFFFF), (phys_address & 0xFFFFFFFF), size) + buf
         out_buf = self._ioctl(IOCTL_WRITE_MMIO, in_buf, 4)
-        return out_buf
+        return int.from_bytes(out_buf, 'little')
 
     def alloc_phys_mem(self, length: int, max_pa: int) -> Tuple[int, int]:
         in_length = 12
@@ -620,9 +621,8 @@ class WindowsHelper(Helper):
 
     def write_msr(self, cpu_thread_id: int, msr_addr: int, eax: int, edx: int) -> int:
         out_length = 0
-        out_buf = (c_char * out_length)()
         in_buf = struct.pack('=4I', cpu_thread_id, msr_addr, eax, edx)
-        out_buf = self._ioctl(IOCTL_WRMSR, in_buf, out_length)
+        self._ioctl(IOCTL_WRMSR, in_buf, out_length)
         return True
 
     def read_pci_reg(self, bus: int, device: int, function: int, address: int, size: int) -> int:
@@ -642,15 +642,13 @@ class WindowsHelper(Helper):
         bdf = PCI_BDF(bus & 0xFFFF, device & 0xFFFF, function & 0xFFFF, address & 0xFFFF)
         out_length = 0
         in_buf = struct.pack('4HIB', bdf.BUS, bdf.DEV, bdf.FUNC, bdf.OFF, value, size)
-        out_buf = self._ioctl(WRITE_PCI_CFG_REGISTER, in_buf, out_length)
+        self._ioctl(WRITE_PCI_CFG_REGISTER, in_buf, out_length)
         return True
 
     def load_ucode_update(self, cpu_thread_id: int, ucode_update_buf: bytes) -> bool:
-        in_length = len(ucode_update_buf) + 3
         out_length = 0
-        out_buf = (c_char * out_length)()
         in_buf = struct.pack('=IH', cpu_thread_id, len(ucode_update_buf)) + ucode_update_buf
-        out_buf = self._ioctl(IOCTL_LOAD_UCODE_PATCH, in_buf, out_length)
+        self._ioctl(IOCTL_LOAD_UCODE_PATCH, in_buf, out_length)
         return True
 
     def read_io_port(self, io_port: int, size: int) -> int:
@@ -667,7 +665,7 @@ class WindowsHelper(Helper):
 
     def write_io_port(self, io_port: int, value: int, size: int) -> bool:
         in_buf = struct.pack('=HIB', io_port, value, size)
-        out_buf = self._ioctl(IOCTL_WRITE_IO_PORT, in_buf, 0)
+        self._ioctl(IOCTL_WRITE_IO_PORT, in_buf, 0)
         return True
 
     def read_cr(self, cpu_thread_id: int, cr_number: int) -> int:
@@ -679,7 +677,7 @@ class WindowsHelper(Helper):
 
     def write_cr(self, cpu_thread_id: int, cr_number: int, value: int) -> int:
         in_buf = struct.pack('=HQI', cr_number, value, cpu_thread_id)
-        out_buf = self._ioctl(IOCTL_WRCR, in_buf, 0)
+        self._ioctl(IOCTL_WRCR, in_buf, 0)
         return True
 
     #
@@ -777,16 +775,15 @@ class WindowsHelper(Helper):
             return None
         if 0 != status:
             lasterror = kernel32.GetLastError()
-            if (0xC0000001 == status and lasterror == 0x000003E6):  # ERROR_NOACCESS: Invalid access to memory location.  https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/18d8fbe8-a967-4f1c-ae50-99ca8e491d2d
-                if logger().DEBUG:
-                    logger().log_warning('NtEnumerateSystemEnvironmentValuesEx was not successful (NTSTATUS = 0xC0000001)')
-                logger().log_debug('[*] Your Windows has restricted access to UEFI variables.\nTo use UEFI variable functions, chipsec needs to run in an older version of windows or in a different environment')
-                return None
+            if (0xC0000001 == status):  # ERROR_NOACCESS: Invalid access to memory location.  https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/18d8fbe8-a967-4f1c-ae50-99ca8e491d2d
+                logger().log_warning('NtEnumerateSystemEnvironmentValuesEx was not successful')
+                logger().log_debug(f'NTSTATUS = 0x{status:08X}, LastError = 0x{lasterror:X}')
+                logger().log_warning('Looks like your version of Windows has restricted access to UEFI variables.\n\tTo use UEFI variable functions, chipsec needs to run in an older version of windows or in a different environment (Linux)')
             else:
                 if logger().DEBUG:
                     logger().log_error(f'NtEnumerateSystemEnvironmentValuesEx failed (GetLastError = 0x{lasterror:X})')
                     logger().log_error(f'*** NTSTATUS: {status:08X}')
-                raise WinError()
+            return None
         logger().log_debug(f'[helper] len(efi_vars) = 0x{len(efi_vars):X} (should be 0x20000)')
         return getEFIvariables_NtEnumerateSystemEnvironmentValuesEx2(bytes(efi_vars))
 
@@ -816,7 +813,7 @@ class WindowsHelper(Helper):
             try:
                 pHandle = win32api.OpenProcess(flags, 0, pid)
             except pywintypes.error as e:
-                print("unable to open a process handle")
+                logger().log("unable to open a process handle")
                 raise ValueError(e)
         return pHandle
 
@@ -826,7 +823,7 @@ class WindowsHelper(Helper):
         try:
             win32process.SetProcessAffinityMask(pHandle, current)
         except win32process.error as e:
-            print("unable to set process affinity")
+            logger().log("unable to set process affinity")
             raise ValueError(e)
         return current
 
@@ -835,7 +832,7 @@ class WindowsHelper(Helper):
         try:
             return win32process.GetProcessAffinityMask(pHandle)[0]
         except win32process.error as e:
-            print("unable to get the running cpu")
+            logger().log("unable to get the running cpu")
             raise ValueError(e)
 
     #
@@ -848,14 +845,23 @@ class WindowsHelper(Helper):
         (eax, ebx, ecx, edx) = struct.unpack('4I', out_buf)
         return (eax, ebx, ecx, edx)
 
-    def get_ACPI_SDT(self) -> Tuple[Optional[Array], bool]:
-        sdt = self.native_get_ACPI_table('XSDT')  # FirmwareTableID_XSDT
-        xsdt = sdt is not None
-        if not xsdt:
-            sdt = self.native_get_ACPI_table('RSDT')  # FirmwareTableID_RSDT
-        return sdt, xsdt
+    def enum_ACPI_tables(self) -> Optional[Array]:
+        table_size = 36
+        tBuffer = create_string_buffer(table_size)
+        retVal = self.EnumSystemFirmwareTbls(FirmwareTableProviderSignature_ACPI, tBuffer, table_size)
+        if retVal == 0:
+            if logger().DEBUG:
+                logger().log_error(f'EnumSystemFirmwareTbls() returned error: {WinError()}')
+            return None
+        if retVal > table_size:
+            table_size = retVal
+            tBuffer = create_string_buffer(table_size)
+            retVal = self.EnumSystemFirmwareTbls(FirmwareTableProviderSignature_ACPI, tBuffer, table_size)
+        tables_array = [tBuffer[i:i+4] for i in range(0, retVal, 4)]
+        return tables_array
 
-    def native_get_ACPI_table(self, table_name: str) -> Optional[Array]:
+    # ACPI access is implemented through ACPI HAL rather than through kernel module
+    def get_ACPI_table(self, table_name: str) -> Optional[Array]:
         table_size = 36
         tBuffer = create_string_buffer(table_size)
         tbl = struct.unpack("<I", bytes(table_name, 'ascii'))[0]
@@ -869,10 +875,6 @@ class WindowsHelper(Helper):
             tBuffer = create_string_buffer(table_size)
             retVal = self.GetSystemFirmwareTbl(FirmwareTableProviderSignature_ACPI, tbl, tBuffer, table_size)
         return tBuffer[:retVal]
-
-    # ACPI access is implemented through ACPI HAL rather than through kernel module
-    def get_ACPI_table(self, table_name):
-        raise UnimplementedAPIError("get_ACPI_table")
 
     #
     # IOSF Message Bus access
