@@ -36,6 +36,7 @@ Usage:
     * ``config`` = use SMI configuration file <config_file>
     * ``fuzz`` = fuzz all SMI handlers with code in the range <smic_start:smic_end>
     * ``fuzzmore`` = fuzz mode + pass 2nd-order pointers within buffer to SMI handlers
+    * ``scan`` = fuzz mode + time measurement to identify SMIs that trigger long-running code paths
 - ``size``: size of the memory buffer (in Hex)
 - ``address``: physical address of memory buffer to pass in GP regs to SMI handlers (in Hex)
 
@@ -70,6 +71,7 @@ Examples:
 
     >>> chipsec_main.py -m tools.smm.smm_ptr
     >>> chipsec_main.py -m tools.smm.smm_ptr -a fuzzmore,0x0:0xFF -l smm.log
+    >>> chipsec_main.py -m tools.smm.smm_ptr -a scan,0x0:0xff
 
 .. warning ::
 
@@ -79,12 +81,17 @@ Examples:
 
 import struct
 import os
+import sys
+import time
+import math
 
-from chipsec.module_common import BaseModule, ModuleResult
-from chipsec.file import write_file
-from chipsec.logger import print_buffer_bytes
+from chipsec.module_common import BaseModule
+from chipsec.library.returncode import ModuleResult
+from chipsec.library.file import write_file
+from chipsec.library.logger import print_buffer_bytes
 from chipsec.hal.interrupts import Interrupts
-from chipsec.exceptions import BadSMIDetected
+from chipsec.library.exceptions import BadSMIDetected
+from chipsec.helper.oshelper import OsHelper
 
 
 #################################################################
@@ -100,6 +107,7 @@ DUMP_MEMORY_ON_DETECT = False
 # False - better performance, True - better results tracking
 FLUSH_OUTPUT_ALWAYS = False
 # makes sure SMI code is logged in case of a crash
+FLUSH_OUTPUT_BEFORE_SMI = True
 FLUSH_OUTPUT_AFTER_SMI = True
 # dump all registers in log before every SMI (True - large size of log file)
 DUMP_GPRS_EVERY_SMI = True
@@ -129,7 +137,7 @@ PTR_IN_ALL_GPRS = False
 # SMI handler may take a pointer/PA from (some offset of off) address passed in GPRs and write to it
 # Treat contents at physical address passed in GPRs as pointers and check contents at that pointer
 # If they changed, SMI handler might have modified them
-#MODE_SECOND_ORDER_BUFFER  = True
+# MODE_SECOND_ORDER_BUFFER  = True
 
 # Max offset of the pointer (physical address)
 # of the 2nd order buffer written in the memory buffer passed to SMI
@@ -138,6 +146,15 @@ MAX_PTR_OFFSET_IN_BUFFER = 0x20
 # very obscure option, don't even try to understand
 GPR_2ADDR = False
 
+# Defines the threshold in standard deviations at which the SMI call is
+# considered long-running
+OUTLIER_STD_DEV = 2
+
+# Number of samples used for initial calibration
+SCAN_CALIB_SAMPLES = 50
+
+# SMI count MSR
+MSR_SMI_COUNT = 0x00000034
 
 #
 # Defaults
@@ -151,6 +168,200 @@ _MAX_ALLOC_PA = 0xFFFFFFFF
 _DEFAULT_GPRS = {'rax': _FILL_VALUE_QWORD, 'rbx': _FILL_VALUE_QWORD, 'rcx': _FILL_VALUE_QWORD, 'rdx': _FILL_VALUE_QWORD, 'rsi': _FILL_VALUE_QWORD, 'rdi': _FILL_VALUE_QWORD}
 
 _pth = 'smm_ptr'
+
+
+class gprs_info:
+    def __init__(self, value):
+        self.gprs = value
+
+    def __repr__(self):
+        return f"rax={self.gprs['rax']:02X} rbx={self.gprs['rbx']:02X} rcx={self.gprs['rcx']:02X}, " \
+               f"rdx={self.gprs['rdx']:02X} rsi={self.gprs['rsi']:02X} rdi={self.gprs['rdi']:02X}"
+
+
+class smi_info:
+    def __init__(self, value):
+        self.duration = value
+        self.gprs = _DEFAULT_GPRS
+        self.code = None
+        self.data = None
+
+    def update(self, value, code, data, gprs):
+        self.duration = value
+        self.gprs = gprs
+        self.code = code
+        self.data = data
+
+    def get_info(self):
+        if self.code is None:
+            return None
+        else:
+            return f'duration {self.duration} code {self.code:02X} data {self.data:02X} ({gprs_info(self.gprs)})'
+
+
+class smi_stats:
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.count = 0
+        self.mean = 0
+        self.m2 = 0
+        self.stdev = 0
+        self.outliers = 0
+
+    #
+    # Computes the standard deviation using the Welford's online algorithm
+    #
+    def update_stats(self, duration):
+        self.count += 1
+        difference = duration - self.mean
+        self.mean += difference / self.count
+        self.m2 += difference * (duration - self.mean)
+        variance = self.m2 / self.count
+        self.stdev = math.sqrt(variance)
+
+    def get_info(self):
+        info = f'average {round(self.mean)} stddev {self.stdev:.2f} checked {self.count}'
+        return info
+
+    #
+    # Combines the statistics of the two data sets using parallel variance computation
+    #
+    def combine(self, partial):
+         self.outliers += partial.outliers
+         total_count = self.count + partial.count
+         difference = partial.mean - self.mean
+         self.mean = (self.mean * self.count + partial.mean * partial.count) / total_count
+         self.m2 += partial.m2 + difference**2 * self.count * partial.count / total_count
+         self.count = total_count
+         variance = self.m2 / self.count
+         self.stdev = math.sqrt(variance)
+
+
+class scan_track:
+    def __init__(self):
+        self.current_smi_stats = smi_stats()
+        self.combined_smi_stats = smi_stats()
+        self.clear()
+        self.helper = OsHelper().get_default_helper()
+        self.helper.init()
+        self.smi_count = self.get_smi_count()
+
+    def __del__(self):
+        self.helper.close()
+
+    def get_smi_count(self):
+        count = -1
+        #
+        # The SMI count is the same on all CPUs
+        #
+        cpu = 0
+        try:
+            count = self.helper.read_msr(cpu, MSR_SMI_COUNT)
+            count = count[1] << 32 | count[0]
+        except UnimplementedAPIError:
+            pass
+        return count
+
+    def valid_smi_count(self):
+        valid = False
+        count = self.get_smi_count()
+        if (count == -1):
+            return True
+        elif (count == self.smi_count + 1):
+            valid = True
+        self.smi_count = count
+        if not valid:
+            sys.stderr.write('SMI contention detected')
+        return valid
+
+    def find_address_in_regs(self, gprs):
+        for key, value in gprs.items():
+            if key == 'rcx':
+                continue
+            if value != _FILL_VALUE_QWORD:
+                return key
+
+    def clear(self):
+        self.outlier = smi_info(0)
+        self.code = None
+        self.contents_changed = False
+        self.needs_calibration = True
+        self.calib_samples = 0
+        self.current_smi_stats.clear()
+
+    def add(self, duration, code, data, gprs, contents_changed=False):
+        if not self.code:
+            self.code = code
+        outlier = self.is_outlier(duration)
+        if not outlier:
+            self.current_smi_stats.update_stats(duration)
+        elif self.is_slow_outlier(duration):
+            self.current_smi_stats.outliers += 1
+            self.outlier.update(duration, code, data, gprs.copy())
+        self.contents_changed = contents_changed
+
+    def update_calibration(self, duration):
+        if not self.needs_calibration:
+            return
+        self.current_smi_stats.update_stats(duration)
+        self.calib_samples += 1
+        if self.calib_samples >= SCAN_CALIB_SAMPLES:
+            self.needs_calibration = False
+
+    def is_slow_outlier(self, value):
+        ret = False
+        if value > self.current_smi_stats.mean + OUTLIER_STD_DEV * self.current_smi_stats.stdev:
+            ret = True
+        if self.combined_smi_stats.count and \
+            value > self.combined_smi_stats.mean + OUTLIER_STD_DEV * self.combined_smi_stats.stdev:
+            ret = True
+        return ret
+
+    def is_fast_outlier(self, value):
+        ret = False
+        if value < self.current_smi_stats.mean - OUTLIER_STD_DEV * self.current_smi_stats.stdev:
+            ret = True
+        if self.combined_smi_stats.count and \
+            value < self.combined_smi_stats.mean - OUTLIER_STD_DEV * self.combined_smi_stats.stdev:
+            ret = True
+        return ret
+
+    def is_outlier(self, value):
+        if self.needs_calibration:
+            return False
+        ret = False
+        if self.is_slow_outlier(value):
+            ret = True
+        if self.is_fast_outlier(value):
+            ret = True
+        return ret
+
+    def skip(self):
+        return self.current_smi_stats.outliers or self.contents_changed
+
+    def found_outlier(self):
+        return bool(self.current_smi_stats.outliers)
+
+    def get_total_outliers(self):
+        return self.combined_smi_stats.outliers
+
+    def get_info(self):
+        info = self.current_smi_stats.get_info()
+        if self.current_smi_stats.outliers:
+            info += f'\n    Identified outlier: {self.outlier.get_info()}'
+        return info
+
+    def log_smi_result(self, logger):
+        msg = f'SCANNED: SMI# {self.code:02X} {self.get_info()}'
+        if self.found_outlier():
+            logger.log_important(msg)
+        else:
+            logger.log(f'[*] {msg}')
+
+    def update_combined_stats(self):
+        self.combined_smi_stats.combine(self.current_smi_stats)
 
 
 class smi_desc:
@@ -188,7 +399,6 @@ class smm_ptr(BaseModule):
         self.test_ptr_in_buffer = False
         self.fill_byte = _MEM_FILL_VALUE
         self.fill_size = _MEM_FILL_SIZE
-        self.rc_res = ModuleResult(0xf8457d4, 'https://chipsec.github.io/modules/chipsec.modules.tools.smm.smm_ptr.html')
 
     def is_supported(self):
         return True
@@ -229,6 +439,19 @@ class smm_ptr(BaseModule):
         self.interrupts.send_SW_SMI(thread_id, smi_code, smi_data, rax, rbx, rcx, rdx, rsi, rdi)
         return True
 
+    def send_smi_timed(self, thread_id, smi_code, smi_data, name, desc, rax, rbx, rcx, rdx, rsi, rdi):
+        self.logger.log(f'    > SMI {smi_code:02X} (data: {smi_data:02X})')
+        if DUMP_GPRS_EVERY_SMI:
+            self.logger.log(f'      RAX: 0x{rax:016X}')
+            self.logger.log(f'      RBX: 0x{rbx:016X}')
+            self.logger.log(f'      RCX: 0x{rcx:016X}')
+            self.logger.log(f'      RDX: 0x{rdx:016X}')
+            self.logger.log(f'      RSI: 0x{rsi:016X}')
+            self.logger.log(f'      RDI: 0x{rdi:016X}')
+        ret = self.interrupts.send_SW_SMI_timed(thread_id, smi_code, smi_data, rax, rbx, rcx, rdx, rsi, rdi)
+        duration = ret[7]
+        return (True, duration)
+
     def check_memory(self, _addr, _smi_desc, fn, restore_contents=False):
         _ptr = _smi_desc.ptr
         filler = self.fill_byte * self.fill_size
@@ -236,7 +459,7 @@ class smm_ptr(BaseModule):
         # Check if contents have changed at physical address passed in GPRs to SMI handler
         # If changed, SMI handler might have written to that address
         #
-        self.logger.log("    < Checking buffers")
+        self.logger.log('    < Checking buffers')
 
         expected_buf = FILL_BUFFER(self.fill_byte, self.fill_size, _smi_desc.ptr_in_buffer, _smi_desc.ptr, _smi_desc.ptr_offset, _smi_desc.sig, _smi_desc.sig_offset)
         buf = self.cs.mem.read_physical_mem(_addr, self.fill_size)
@@ -288,12 +511,15 @@ class smm_ptr(BaseModule):
 
         return (_changed or _changed1)
 
-    def smi_fuzz_iter(self, thread_id, _addr, _smi_desc, fill_contents=True, restore_contents=False):
+    def smi_fuzz_iter(self, thread_id, _addr, _smi_desc, fill_contents=True, restore_contents=False, scan=None):
         #
         # Fill memory buffer if not in 'No Fill' mode
         #
         if self.is_check_memory and fill_contents:
             self.fill_memory(_addr, _smi_desc.ptr_in_buffer, _smi_desc.ptr, _smi_desc.ptr_offset, _smi_desc.sig, _smi_desc.sig_offset)
+
+        if FLUSH_OUTPUT_BEFORE_SMI:
+            self.logger.flush()
         #
         # Invoke SW SMI Handler
         #
@@ -303,8 +529,26 @@ class smm_ptr(BaseModule):
         _rdx = _smi_desc.gprs['rdx']
         _rsi = _smi_desc.gprs['rsi']
         _rdi = _smi_desc.gprs['rdi']
-        self.send_smi(thread_id, _smi_desc.smi_code, _smi_desc.smi_data, _smi_desc.name, _smi_desc.desc, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
-
+        if not scan:
+            self.send_smi(thread_id, _smi_desc.smi_code, _smi_desc.smi_data, _smi_desc.name, _smi_desc.desc, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
+        else:
+            while True:
+                _, duration = self.send_smi_timed(thread_id, _smi_desc.smi_code, _smi_desc.smi_data, _smi_desc.name, _smi_desc.desc, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
+                if not scan.valid_smi_count():
+                    continue
+                if scan.needs_calibration:
+                    scan.update_calibration(duration)
+                    continue
+                else:
+                    break
+            #
+            # Re-do the call if it was identified as an outlier, due to periodic SMI delays
+            #
+            if scan.is_outlier(duration):
+                while True:
+                    _, duration = self.send_smi_timed(thread_id, _smi_desc.smi_code, _smi_desc.smi_data, _smi_desc.name, _smi_desc.desc, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
+                    if scan.valid_smi_count():
+                        break
         #
         # Check memory buffer if not in 'No Fill' mode
         #
@@ -315,8 +559,11 @@ class smm_ptr(BaseModule):
             if contents_changed:
                 msg = f'DETECTED: SMI# {_smi_desc.smi_code:X} data {_smi_desc.smi_data:X} (rax={_rax:X} rbx={_rbx:X} rcx={_rcx:X} rdx={_rdx:X} rsi={_rsi:X} rdi={_rdi:X})'
                 self.logger.log_important(msg)
-                if FUZZ_BAIL_ON_1ST_DETECT:
+                if FUZZ_BAIL_ON_1ST_DETECT and not scan:
                     raise BadSMIDetected(msg)
+
+        if scan:
+            scan.add(duration, _smi_desc.smi_code, _smi_desc.smi_data, _smi_desc.gprs, contents_changed)
 
         if FLUSH_OUTPUT_AFTER_SMI:
             self.logger.flush()
@@ -364,19 +611,23 @@ class smm_ptr(BaseModule):
 
         return bad_ptr_cnt
 
-    def test_fuzz(self, thread_id, smic_start, smic_end, _addr, _addr1):
+    def test_fuzz(self, thread_id, smic_start, smic_end, _addr, _addr1, scan_mode=False):
+
+        scan = None
+        if scan_mode:
+            scan = scan_track()
 
         gpr_value = ((_addr << 32) | _addr) if GPR_2ADDR else _addr
 
         gprs_addr = {'rax': gpr_value, 'rbx': gpr_value, 'rcx': gpr_value, 'rdx': gpr_value, 'rsi': gpr_value, 'rdi': gpr_value}
         gprs_fill = {'rax': _FILL_VALUE_QWORD, 'rbx': _FILL_VALUE_QWORD, 'rcx': _FILL_VALUE_QWORD, 'rdx': _FILL_VALUE_QWORD, 'rsi': _FILL_VALUE_QWORD, 'rdi': _FILL_VALUE_QWORD}
-        self.logger.log("\n[*] >>> Fuzzing SMI handlers..")
-        self.logger.log("[*] AX in RAX will be overridden with values of SW SMI ports 0xB2/0xB3")
-        self.logger.log("    DX in RDX will be overridden with value 0x00B2")
+        self.logger.log('\n[*] >>> Fuzzing SMI handlers..')
+        self.logger.log('[*] AX in RAX will be overridden with values of SW SMI ports 0xB2/0xB3')
+        self.logger.log('    DX in RDX will be overridden with value 0x00B2')
 
         bad_ptr_cnt = 0
         _smi_desc = smi_desc()
-        _smi_desc.gprs = gprs_addr if PTR_IN_ALL_GPRS else gprs_fill
+        _smi_desc.gprs = gprs_addr if PTR_IN_ALL_GPRS or scan_mode else gprs_fill
         self.logger.log(f'\n[*] Setting values of general purpose registers to 0x{_smi_desc.gprs["rax"]:016X}')
         max_ptr_off = 1
 
@@ -402,9 +653,11 @@ class smm_ptr(BaseModule):
                         for _rcx in range(MAX_SMI_FUNCTIONS):
                             self.logger.log(f' >> Function (RCX): 0x{_rcx:016X}')
                             _smi_desc.gprs['rcx'] = _rcx
-                            if PTR_IN_ALL_GPRS:
-                                if self.smi_fuzz_iter(thread_id, _addr, _smi_desc, False, True):
+                            if PTR_IN_ALL_GPRS or scan_mode:
+                                if self.smi_fuzz_iter(thread_id, _addr, _smi_desc, False, True, scan):
                                     bad_ptr_cnt += 1
+                                if scan and scan.skip():
+                                    break
                             else:
                                 self.logger.log(f'    RBX: 0x{_addr:016X}')
                                 _smi_desc.gprs['rbx'] = gpr_value
@@ -424,8 +677,8 @@ class smm_ptr(BaseModule):
                                     bad_ptr_cnt += 1
                                 _smi_desc.gprs['rdi'] = _FILL_VALUE_QWORD
                     else:
-                        if PTR_IN_ALL_GPRS:
-                            if self.smi_fuzz_iter(thread_id, _addr, _smi_desc, False, True):
+                        if PTR_IN_ALL_GPRS or scan_mode:
+                            if self.smi_fuzz_iter(thread_id, _addr, _smi_desc, False, True, scan):
                                 bad_ptr_cnt += 1
                         else:
                             self.logger.log(f'    RBX: 0x{_addr:016X}')
@@ -451,19 +704,26 @@ class smm_ptr(BaseModule):
                             if self.smi_fuzz_iter(thread_id, _addr, _smi_desc, False, True):
                                 bad_ptr_cnt += 1
                             _smi_desc.gprs['rdi'] = _FILL_VALUE_QWORD
+                    if scan and scan.skip():
+                        break
+                if scan_mode:
+                    scan.log_smi_result(self.logger)
+                    scan.update_combined_stats()
+                    scan.clear()
 
-        return bad_ptr_cnt
+        return bad_ptr_cnt, scan
 
     def run(self, module_argv):
-        self.logger.start_test("A tool to test SMI handlers for pointer validation vulnerabilities")
-        self.logger.log("Usage: chipsec_main -m tools.smm.smm_ptr [ -a <mode>,<config_file>|<smic_start:smic_end>,<size>,<address> ]")
-        self.logger.log("  mode          SMI handlers testing mode")
-        self.logger.log("    = config    use SMI configuration file <config_file>")
-        self.logger.log("    = fuzz      fuzz all SMI handlers with code in the range <smic_start:smic_end>")
-        self.logger.log("    = fuzzmore  fuzz mode + pass '2nd-order' pointers within buffer to SMI handlers")
-        self.logger.log("  size          size of the memory buffer (in Hex)")
-        self.logger.log("  address       physical address of memory buffer to pass in GP regs to SMI handlers (in Hex)")
-        self.logger.log("    = smram     pass address of SMRAM base (system may hang in this mode!)\n")
+        self.logger.start_test('A tool to test SMI handlers for pointer validation vulnerabilities')
+        self.logger.log('Usage: chipsec_main -m tools.smm.smm_ptr [ -a <mode>,<config_file>|<smic_start:smic_end>,<size>,<address> ]')
+        self.logger.log('  mode          SMI handlers testing mode')
+        self.logger.log('    = config    use SMI configuration file <config_file>')
+        self.logger.log('    = fuzz      fuzz all SMI handlers with code in the range <smic_start:smic_end>')
+        self.logger.log('    = fuzzmore  fuzz mode + pass `2nd-order` pointers within buffer to SMI handlers')
+        self.logger.log('    = scan      fuzz mode + time measurement to identify SMIs that trigger long-running code paths')
+        self.logger.log('  size          size of the memory buffer (in Hex)')
+        self.logger.log('  address       physical address of memory buffer to pass in GP regs to SMI handlers (in Hex)')
+        self.logger.log('    = smram     pass address of SMRAM base (system may hang in this mode!)\n')
 
         test_mode = 'config'
         _smi_config_fname = 'chipsec/modules/tools/smm/smm_config.ini'
@@ -478,17 +738,19 @@ class smm_ptr(BaseModule):
             test_mode = module_argv[0].lower()
             if test_mode == 'config':
                 _smi_config_fname = module_argv[1]
-            elif test_mode in ['fuzz', 'fuzzmore']:
+            elif test_mode in ['fuzz', 'fuzzmore', 'scan']:
                 smic_arr = module_argv[1].split(':')
                 smic_start = int(smic_arr[0], 16)
                 smic_end = int(smic_arr[1], 16)
                 if test_mode == 'fuzzmore':
                     self.test_ptr_in_buffer = True
                     DUMP_GPRS_EVERY_SMI = False
+                elif test_mode == 'scan':
+                    self.test_ptr_in_buffer = False
             else:
                 self.logger.log_error(f'Unknown fuzzing mode \'{module_argv[0]}\'')
-                self.rc_res.setStatusBit(self.rc_res.status.UNSUPPORTED_OPTION)
-                return self.rc_res.getReturnCode(ModuleResult.ERROR)
+                self.result.setStatusBit(self.result.status.UNSUPPORTED_OPTION)
+                return self.result.getReturnCode(ModuleResult.ERROR)
 
         if len(module_argv) > 2:
             self.fill_size = int(module_argv[2], 16)
@@ -508,9 +770,7 @@ class smm_ptr(BaseModule):
             (_, _addr1) = self.cs.mem.alloc_physical_mem(self.fill_size, _MAX_ALLOC_PA)
             self.logger.log(f'[*] Allocated 2nd buffer (address will be in the 1st buffer): 0x{_addr1:016X}')
 
-        #
         # @TODO: Need to check that SW/APMC SMI is enabled
-        #
 
         self.logger.log('\n[*] Configuration:')
         self.logger.log(f'    SMI testing mode          : {test_mode}')
@@ -524,7 +784,7 @@ class smm_ptr(BaseModule):
             self.logger.log(f'      Second buffer pointer   : 0x{_addr1:016X} (address written to memory buffer)')
             self.logger.log(f'      Number of bytes to fill : 0x{self.fill_size:X}')
             self.logger.log(f'      Byte to fill with       : 0x{ord(self.fill_byte):X}')
-        self.logger.log(f'    Additional options (can be changed in the source code):f')
+        self.logger.log('    Additional options (can be changed in the source code):')
         self.logger.log(f'      Fuzzing SMI functions in ECX?          : {FUZZ_SMI_FUNCTIONS_IN_ECX:d}')
         self.logger.log(f'      Max value of SMI function in ECX       : 0x{MAX_SMI_FUNCTIONS:X}')
         self.logger.log(f'      Max value of SMI data (B3)             : 0x{MAX_SMI_DATA:X}')
@@ -539,22 +799,29 @@ class smm_ptr(BaseModule):
             os.makedirs(_pth)
 
         bad_ptr_cnt = 0
+        scan_mode = False
         try:
             if 'config' == test_mode:
                 bad_ptr_cnt = self.test_config(thread_id, _smi_config_fname, _addr, _addr1)
             elif test_mode in ['fuzz', 'fuzzmore']:
-                bad_ptr_cnt = self.test_fuzz(thread_id, smic_start, smic_end, _addr, _addr1)
-        except BadSMIDetected as msg:
+                bad_ptr_cnt, _ = self.test_fuzz(thread_id, smic_start, smic_end, _addr, _addr1)
+            elif test_mode in ['scan']:
+                scan_mode =  True
+                scan = None
+                bad_ptr_cnt, scan = self.test_fuzz(thread_id, smic_start, smic_end, _addr, _addr1, True)
+        except BadSMIDetected:
             bad_ptr_cnt = 1
-            self.logger.log_important("Potentially bad SMI detected! Stopped fuzing (see FUZZ_BAIL_ON_1ST_DETECT option)")
+            self.logger.log_important('Potentially bad SMI detected! Stopped fuzing (see FUZZ_BAIL_ON_1ST_DETECT option)')
 
+        if scan_mode and scan:
+            self.logger.log_good(f'<<< Done: found {scan.get_total_outliers()} long-running SMIs')
         if bad_ptr_cnt > 0:
             self.logger.log_bad(f'<<< Done: found {bad_ptr_cnt:d} potential occurrences of unchecked input pointers')
-            self.rc_res.setStatusBit(self.rc_res.status.POTENTIALLY_VULNERABLE)
-            self.res = self.rc_res.getReturnCode(ModuleResult.FAILED)
+            self.result.setStatusBit(self.result.status.POTENTIALLY_VULNERABLE)
+            self.res = self.result.getReturnCode(ModuleResult.FAILED)
         else:
-            self.logger.log_good("<<< Done: didn't find unchecked input pointers in tested SMI handlers")
-            self.rc_res.setStatusBit(self.rc_res.status.SUCCESS)
-            self.res = self.rc_res.getReturnCode(ModuleResult.PASSED)
+            self.logger.log_good('<<< Done: did not find unchecked input pointers in tested SMI handlers')
+            self.result.setStatusBit(self.result.status.SUCCESS)
+            self.res = self.result.getReturnCode(ModuleResult.PASSED)
 
         return self.res

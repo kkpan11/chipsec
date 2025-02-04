@@ -33,12 +33,13 @@ usage:
 """
 
 import re
+from collections.abc import Callable
+from typing import Dict, Optional, Any
 from uuid import UUID
-from typing import Dict, Callable, Optional, Any
 
-from chipsec import defines
+from chipsec.library import defines
 from chipsec.hal.spi_uefi import EFI_SECTION
-from chipsec.logger import logger
+from chipsec.library.logger import logger
 
 #
 # - EFI binaries are searched according to criteria defined by "match" rules.

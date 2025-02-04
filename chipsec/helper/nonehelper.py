@@ -18,7 +18,7 @@
 # chipsec@intel.com
 #
 
-from chipsec.exceptions import UnimplementedAPIError
+from chipsec.library.exceptions import UnimplementedAPIError
 from chipsec.helper.basehelper import Helper
 from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
@@ -156,10 +156,11 @@ class NoneHelper(Helper):
     #
     # ACPI
     #
-    def get_ACPI_SDT(self) -> Tuple[Optional['Array'], bool]:
-        raise UnimplementedAPIError('NoneHelper')
 
     def get_ACPI_table(self, table_name: str) -> Optional['Array']:
+        raise UnimplementedAPIError('NoneHelper')
+    
+    def enum_ACPI_tables(self) -> Optional['Array']:
         raise UnimplementedAPIError('NoneHelper')
 
     #

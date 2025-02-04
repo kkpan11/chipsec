@@ -37,12 +37,13 @@ import struct
 import random
 import json
 import string
+from collections.abc import Callable
 from uuid import UUID
-from typing import Dict, List, Optional, Union, Any, Callable, TYPE_CHECKING
+from typing import Dict, List, Optional, Union, Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from chipsec.hal.uefi_fv import EFI_MODULE
-from chipsec.logger import logger
-from chipsec.file import write_file, read_file
+from chipsec.library.logger import logger
+from chipsec.library.file import write_file, read_file
 from chipsec.hal.uefi_compression import COMPRESSION_TYPE_LZMA, COMPRESSION_TYPE_EFI_STANDARD, COMPRESSION_TYPES_ALGORITHMS, COMPRESSION_TYPE_UNKNOWN, COMPRESSION_TYPE_LZMAF86
 from chipsec.hal.uefi_common import bit_set, EFI_GUID_SIZE, EFI_GUID_FMT
 from chipsec.hal.uefi_platform import FWType, fw_types, EFI_NVRAM_GUIDS, EFI_PLATFORM_FS_GUIDS, NVAR_NVRAM_FS_FILE
@@ -144,7 +145,7 @@ def modify_uefi_region(data: bytes, command: int, guid: UUID, uefi_file: bytes =
     return data
 
 
-def build_efi_modules_tree(fwtype: str, data: bytes, Size: int, offset: int, polarity: bool) -> List[EFI_SECTION]:
+def build_efi_modules_tree(fwtype: Optional[str], data: bytes, Size: int, offset: int, polarity: bool) -> List[EFI_SECTION]:
     sections: List[EFI_SECTION] = []
     secn = 0
 
@@ -252,7 +253,7 @@ def build_efi_modules_tree(fwtype: str, data: bytes, Size: int, offset: int, pol
 # Input arguements:
 # fv_image - fv_image containing files
 # fwtype - platform specific firmware type used to detect NVRAM format (VSS, EVSA, NVAR...)
-def build_efi_file_tree(fv_img: bytes, fwtype: str) -> List[EFI_FILE]:
+def build_efi_file_tree(fv_img: bytes, fwtype: Optional[str]) -> List[EFI_FILE]:
     fv_size, HeaderSize, Attributes = GetFvHeader(fv_img)
     polarity = bool(Attributes & EFI_FVB2_ERASE_POLARITY)
     fwbin = NextFwFile(fv_img, fv_size, HeaderSize, polarity)
@@ -261,19 +262,22 @@ def build_efi_file_tree(fv_img: bytes, fwtype: str) -> List[EFI_FILE]:
     while fwbin is not None:
         fw_offset = fwbin.Size + fwbin.Offset
         fwbin.calc_hashes()
-        if padding != fwbin.Offset:
-            non_UEFI = EFI_SECTION(padding, 'Padding', EFI_FV_FILETYPE_FFS_PAD, fv_img[padding:fw_offset - 1], 0, fwbin.Offset - padding)
-            non_UEFI.Comments = 'Attempting to identify modules in Padding Section'
-            non_UEFI.children = efi_data_search(fv_img[padding:fwbin.Offset - 1], fwtype, polarity)
+        if padding < fwbin.Offset:
+            non_UEFI = EFI_SECTION(padding, 'Non-UEFI_Padding', EFI_FV_FILETYPE_FFS_PAD,
+                                   fv_img[padding:fw_offset - 1], 0, fwbin.Offset - padding)
+            non_UEFI.Comments = 'Attempting to identify modules in non-UEFI Padding Section'
+            non_UEFI.children = find_efi_modules(data=fv_img[padding:fwbin.Offset - 1], fwtype=fwtype, polarity=polarity)
             if non_UEFI.children:
                 fv.append(non_UEFI)
-        padding += fw_offset
+        padding = fw_offset
         if fwbin.Type not in (EFI_FV_FILETYPE_ALL, EFI_FV_FILETYPE_RAW, EFI_FV_FILETYPE_FFS_PAD):
-            fwbin.children = efi_data_search(fwbin.Image[fwbin.HeaderSize:], fwtype, polarity)
+            fwbin.children = find_efi_modules(data=fwbin.Image, fwtype=fwtype, polarity=polarity,
+                                              data_start=fwbin.HeaderSize)
             fv.append(fwbin)
         elif fwbin.Type == EFI_FV_FILETYPE_RAW:
             if fwbin.Name != NVAR_NVRAM_FS_FILE:
-                fwbin.children = efi_data_search(fwbin.Image, fwtype, polarity)
+                fwbin.children = find_efi_modules(data=fwbin.Image, fwtype=fwtype, polarity=polarity,
+                                                  data_size=fwbin.Size, data_start=fwbin.HeaderSize)
                 fv.append(fwbin)
             else:
                 fwbin.isNVRAM = True
@@ -282,17 +286,18 @@ def build_efi_file_tree(fv_img: bytes, fwtype: str) -> List[EFI_FILE]:
         elif fwbin.Type == EFI_FV_FILETYPE_FFS_PAD:
             non_UEFI = EFI_SECTION(fwbin.Offset, 'Padding', fwbin.Type, fv_img[fw_offset:], 0, fwbin.Size)
             non_UEFI.Comments = 'Attempting to identify modules in Padding Section'
-            non_UEFI.children = efi_data_search(fwbin.Image, fwtype, polarity)
+            non_UEFI.children = find_efi_modules(data=fwbin.Image, fwtype=fwtype, polarity=polarity)
             if non_UEFI.children:
                 fv.append(non_UEFI)
         elif fwbin.State not in (EFI_FILE_HEADER_CONSTRUCTION, EFI_FILE_HEADER_INVALID, EFI_FILE_HEADER_VALID):
-            fwbin.children = efi_data_search(fwbin.Image[fwbin.HeaderSize:], fwtype, polarity)
+            fwbin.children = find_efi_modules(data=fwbin.Image, fwtype=fwtype, polarity=polarity,
+                                              data_size=fwbin.Size, data_start=fwbin.HeaderSize)
             fv.append(fwbin)
         fwbin = NextFwFile(fv_img, fv_size, fw_offset, polarity)
         if fwbin is None and fv_size > fw_offset:
-            non_UEFI = EFI_SECTION(fw_offset, 'Non-UEFI_data', 0xFF, fv_img[fw_offset:], 0, fv_size - fw_offset)
-            non_UEFI.Comments = 'Attempting to identify modules in non_UEFI Data Section'
-            non_UEFI.children = efi_data_search(fv_img[fw_offset:], fwtype, polarity)
+            non_UEFI = EFI_SECTION(fw_offset, 'Non-UEFI_Data', 0xFF, fv_img[fw_offset:], 0, fv_size - fw_offset)
+            non_UEFI.Comments = 'Attempting to identify modules in non-UEFI Data Section'
+            non_UEFI.children = find_efi_modules(data=fv_img[fw_offset:], fwtype=fwtype, polarity=polarity)
             if non_UEFI.children:
                 fv.append(non_UEFI)
     return fv
@@ -305,7 +310,7 @@ def build_efi_file_tree(fv_img: bytes, fwtype: str) -> List[EFI_FILE]:
 #   data           - an image containing UEFI firmware volumes
 #   fwtype         - platform specific firmware type used to detect NVRAM format (VSS, EVSA, NVAR...)
 #
-def build_efi_tree(data: bytes, fwtype: str) -> List['EFI_MODULE']:
+def build_efi_tree(data: bytes, fwtype: Optional[str]) -> List['EFI_MODULE']:
     fvolumes = []
     fv = NextFwVolume(data)
     while fv is not None:
@@ -324,6 +329,9 @@ def build_efi_tree(data: bytes, fwtype: str) -> List['EFI_MODULE']:
                 fv.NVRAMType = identify_EFI_NVRAM(fv.Image) if fwtype is None else fwtype
             except Exception:
                 logger().log_warning(f"Couldn't identify NVRAM in FV {{{fv.Guid}}}")
+            fwbin = build_efi_file_tree(fv.Image, fwtype)
+            for i in fwbin:
+                fv.children.append(i)
 
         fvolumes.append(fv)
         fv = NextFwVolume(data, fv.Offset, fv.Size)
@@ -332,15 +340,22 @@ def build_efi_tree(data: bytes, fwtype: str) -> List['EFI_MODULE']:
 
 
 #
-# Attempt to find efi modules using calls to build_efi_tree, build_efi_file_tree,
-# and build_efi_modules_tree in succession.  Return once one of the calls is successful
+# Attempts to find EFI modules by calling build_efi_tree (FV), build_efi_file_tree (FILE),
+# and build_efi_modules_tree (SECTION), in succession, stopping on first successful call.
 #
-def efi_data_search(data: bytes, fwtype: str, polarity: bool):
-    efi_tree = build_efi_tree(data, fwtype)
+def find_efi_modules(data: bytes, fwtype: Optional[str], polarity: bool, data_size: Optional[int] = None,
+                     data_start: Optional[int] = None) -> List['EFI_MODULE']:
+    data_len: int = len(data) if data_size is None else data_size
+    data_off: int = 0 if data_start is None else data_start
+
+    efi_tree: List['EFI_MODULE'] = build_efi_tree(data=data[data_off:data_len], fwtype=fwtype)
+
     if not efi_tree:
-        efi_tree = build_efi_file_tree(data, fwtype)
-        if not efi_tree:
-            efi_tree = build_efi_modules_tree(fwtype, data, len(data), 0, polarity)
+        efi_tree = build_efi_file_tree(fv_img=data[data_off:data_len], fwtype=fwtype)
+
+    if not efi_tree:
+        efi_tree = build_efi_modules_tree(fwtype=fwtype, data=data, Size=data_len, offset=data_off, polarity=polarity)
+
     return efi_tree
 
 
@@ -374,7 +389,7 @@ def update_efi_tree(modules: List['EFI_MODULE'], parent_guid: Optional[UUID] = N
     return ui_string
 
 
-def build_efi_model(data: bytes, fwtype: str) -> List['EFI_MODULE']:
+def build_efi_model(data: bytes, fwtype: Optional[str]) -> List['EFI_MODULE']:
     model = build_efi_tree(data, fwtype)
     update_efi_tree(model)
     return model
@@ -413,10 +428,11 @@ def dump_efi_module(mod, parent: Optional['EFI_MODULE'], modn: int, path: str) -
 
 
 class EFIModuleType:
-    SECTION_EXE = 0
-    SECTION = 1
-    FV = 2
-    FILE = 4
+    SECTION_EXE = 1
+    SECTION = 2
+    FV = 4
+    FILE = 8
+    ALL = 15
 
 
 def search_efi_tree(modules: List['EFI_MODULE'],
@@ -516,7 +532,7 @@ class UUIDEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
-def parse_uefi_region_from_file(filename: str, fwtype: str, outpath: Optional[str] = None, filetype: List[int] = []) -> None:
+def parse_uefi_region_from_file(filename: str, fwtype: Optional[str], outpath: Optional[str] = None, filetype: List[int] = []) -> None:
     # Create an output folder to dump EFI module tree
     if outpath is None:
         outpath = f'{filename}.dir'
@@ -537,7 +553,7 @@ def parse_uefi_region_from_file(filename: str, fwtype: str, outpath: Optional[st
     write_file(f'{filename}.UEFI.json', json.dumps(tree_json, indent=2, separators=(',', ': '), cls=UUIDEncoder))
 
 
-def decode_uefi_region(pth: str, fname: str, fwtype: str, filetype: List[int] = []) -> None:
+def decode_uefi_region(pth: str, fname: str, fwtype: Optional[str], filetype: List[int] = []) -> None:
 
     bios_pth = os.path.join(pth, f'{fname}.dir')
     if not os.path.exists(bios_pth):
@@ -574,7 +590,7 @@ def save_efi_tree_filetype(modules: List['EFI_MODULE'],
                            path: str = '',
                            lvl: int = 0,
                            filetype: List[int] = [],
-                           save: bool = False
+                           save: bool = True
                            ) -> List[Dict[str, Any]]:
     mod_dir_path = path
     modules_arr = []
@@ -582,7 +598,7 @@ def save_efi_tree_filetype(modules: List['EFI_MODULE'],
     for m in modules:
         md: Dict[str, Any] = {}
         m.indent = DEF_INDENT * lvl
-        if (isinstance(m, EFI_FILE) and m.Type in filetype) or save:
+        if (isinstance(m, EFI_FILE) and m.Type in filetype) and save:
             logger().log(str(m))
 
         # extract all non-function non-None members of EFI_MODULE objects
@@ -607,7 +623,7 @@ def save_efi_tree_filetype(modules: List['EFI_MODULE'],
                     os.makedirs(mod_dir_path)
         # save children modules
         if len(m.children) > 0:
-            md["children"] = save_efi_tree_filetype(m.children, m, mod_dir_path, lvl + 1, filetype)
+            md["children"] = save_efi_tree_filetype(m.children, m, mod_dir_path, lvl + 1, filetype, save)
         else:
             del md["children"]
 

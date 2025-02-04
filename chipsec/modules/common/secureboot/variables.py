@@ -43,16 +43,14 @@ Examples:
 """
 
 
-from chipsec.module_common import BaseModule, ModuleResult, MTAG_SECUREBOOT, OPT_MODIFY
+from chipsec.module_common import BaseModule, MTAG_SECUREBOOT, OPT_MODIFY
+from chipsec.library.returncode import ModuleResult
 from chipsec.hal.uefi import UEFI, SECURE_BOOT_VARIABLES, IS_VARIABLE_ATTRIBUTE, EFI_VAR_NAME_SecureBoot, SECURE_BOOT_KEY_VARIABLES
 from chipsec.hal.uefi import EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS
 from chipsec.hal.uefi import SECURE_BOOT_OPTIONAL_VARIABLES
 from chipsec.hal.uefi_common import StatusCode
 from typing import AnyStr, List, Optional
 
-# ############################################################
-# SPECIFY PLATFORMS THIS MODULE IS APPLICABLE TO
-# ############################################################
 _MODULE_NAME = 'variables'
 
 
@@ -64,14 +62,12 @@ class variables(BaseModule):
     def __init__(self):
         BaseModule.__init__(self)
         self._uefi = UEFI(self.cs)
-        self.rc_res = ModuleResult(0x7af0b3e, 'https://chipsec.github.io/modules/chipsec.modules.common.secureboot.variables.html')
+        self.result.url = 'https://chipsec.github.io/modules/chipsec.modules.common.secureboot.variables.html'
 
     def is_supported(self) -> bool:
         supported = self.cs.helper.EFI_supported()
         if not supported:
             self.logger.log_important('OS does not support UEFI Runtime API.  Skipping module.')
-            self.rc_res.setStatusBit(self.rc_res.status.NOT_APPLICABLE)
-            self.res = self.rc_res.getReturnCode(ModuleResult.NOTAPPLICABLE)
         return supported
 
     def can_modify(self, name: str, guid: Optional[AnyStr], data: Optional[bytes]) -> bool:
@@ -96,7 +92,6 @@ class variables(BaseModule):
             self.logger.log_bad(f'EFI variable {name} has been modified. Restoring original contents..')
             self._uefi.set_EFI_variable(name, guid, data)
 
-            # checking if restored correctly
             restoreddata = self._uefi.get_EFI_variable(name, guid)
             if (restoreddata != data):
                 self.logger.log_important(f'Failed to restore contents of variable {name} failed!')
@@ -106,8 +101,6 @@ class variables(BaseModule):
             self.logger.log_good(f'Could not modify UEFI variable {guid}:{name}')
         return _changed
 
-    # check_secureboot_variable_attributes
-    # checks authentication attributes of Secure Boot EFI variables
     def check_secureboot_variable_attributes(self, do_modify: bool) -> int:
         not_found = 0
         not_auth = 0
@@ -117,26 +110,22 @@ class variables(BaseModule):
         sbvars = self._uefi.list_EFI_variables()
         if sbvars is None:
             self.logger.log_warning('Could not enumerate UEFI variables.')
-            self.rc_res.setStatusBit(self.rc_res.status.CONFIGURATION)
-            return self.rc_res.getReturnCode(ModuleResult.WARNING)
+            self.result.setStatusBit(self.result.status.CONFIGURATION)
+            return self.result.getReturnCode(ModuleResult.WARNING)
 
         for name in SECURE_BOOT_VARIABLES:
 
             if (name in sbvars.keys()) and (sbvars[name] is not None):
                 if len(sbvars[name]) > 1:
                     self.logger.log_failed(f'There should only be one instance of variable {name}')
-                    self.rc_res.setStatusBit(self.rc_res.status.VERIFY)
-                    return self.rc_res.getReturnCode(ModuleResult.FAILED)
+                    self.result.setStatusBit(self.result.status.VERIFY)
+                    return self.result.getReturnCode(ModuleResult.FAILED)
                 for (_, _, _, data, guid, attrs) in sbvars[name]:
                     self.logger.log(f'[*] Checking protections of UEFI variable {guid}:{name}')
 
-                    # check the status of Secure Boot
                     if EFI_VAR_NAME_SecureBoot == name:
                         is_secureboot_enabled = (data is not None) and (len(data) == 1) and (ord(data) == 0x1)
 
-                    #
-                    # Verify if the Secure Boot key/database variable is authenticated
-                    #
                     if name in SECURE_BOOT_KEY_VARIABLES:
                         if IS_VARIABLE_ATTRIBUTE(attrs, EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS):
                             self.logger.log_good(f'Variable {guid}:{name} is authenticated (AUTHENTICATED_WRITE_ACCESS)')
@@ -146,9 +135,6 @@ class variables(BaseModule):
                             not_auth += 1
                             self.logger.log_bad(f'Variable {guid}:{name} is not authenticated')
 
-                    #
-                    # Attempt to modify contents of the variables
-                    #
                     if do_modify:
                         if self.can_modify(name, guid, data):
                             not_wp += 1
@@ -165,13 +151,11 @@ class variables(BaseModule):
         self.logger.log(f'[*] Secure Boot appears to be {prefix}abled')
 
         if len(SECURE_BOOT_VARIABLES) == not_found:
-            # None of Secure Boot variables were not found
             self.logger.log_warning('None of required Secure Boot variables found.')
             self.logger.log_important('If Secure Boot is enabled, this could be a problem.')
-            self.rc_res.setStatusBit(self.rc_res.status.VERIFY)
-            return self.rc_res.getReturnCode(ModuleResult.WARNING)
+            self.result.setStatusBit(self.result.status.VERIFY)
+            return self.result.getReturnCode(ModuleResult.WARNING)
         else:
-            # Some Secure Boot variables exist
             sb_vars_failed = (not_found > 0) or (not_auth > 0) or (not_wp > 0)
             if sb_vars_failed:
                 if not_found > 0:
@@ -183,17 +167,17 @@ class variables(BaseModule):
 
                 if is_secureboot_enabled:
                     self.logger.log_failed('Not all Secure Boot UEFI variables are protected')
-                    self.rc_res.setStatusBit(self.rc_res.status.PROTECTION)
-                    return self.rc_res.getReturnCode(ModuleResult.FAILED)
+                    self.result.setStatusBit(self.result.status.PROTECTION)
+                    return self.result.getReturnCode(ModuleResult.FAILED)
                 else:
                     self.logger.log_warning('Not all Secure Boot UEFI variables are protected')
-                    self.rc_res.setStatusBit(self.rc_res.status.FEATURE_DISABLED)
-                    return self.rc_res.getReturnCode(ModuleResult.WARNING)
+                    self.result.setStatusBit(self.result.status.FEATURE_DISABLED)
+                    return self.result.getReturnCode(ModuleResult.WARNING)
 
             else:
                 self.logger.log_passed('All Secure Boot UEFI variables are protected')
-                self.rc_res.setStatusBit(self.rc_res.status.SUCCESS)
-                return self.rc_res.getReturnCode(ModuleResult.PASSED)
+                self.result.setStatusBit(self.result.status.SUCCESS)
+                return self.result.getReturnCode(ModuleResult.PASSED)
 
     def run(self, module_argv: List[str]) -> int:
         self.logger.start_test('Attributes of Secure Boot EFI Variables')

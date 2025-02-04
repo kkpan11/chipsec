@@ -40,31 +40,21 @@ https://www.sphinx-doc.org/en/master/usage/extensions/autodoc.html
 """
 
 import os
-from typing import Sequence
+try:
+    from collections.abc import Sequence
+except ImportError:
+    from typing import Sequence
+    print('!! Unable to import collections.abc !!')
 import shutil
 import sys
 
 DOCS_DIR = os.getcwd()
+RM_DIR = os.path.join(DOCS_DIR, '_remove')
 SPHINX_DIR = os.path.join(DOCS_DIR, 'sphinx')
 SPHINX_MOD_DIR = os.path.join(SPHINX_DIR, 'modules')
 SPHINX_SCRIPTS_DIR = os.path.join(SPHINX_DIR, '_scripts')
 CHIPSEC_DIR = os.path.normpath(DOCS_DIR + os.sep + os.pardir)
 
-NotWantedFilesList = [
-    'setup.rst',
-    'chipsec.rst',
-    'chipsec.banner.rst',
-    'chipsec.cfg.rst',
-    'chipsec.chipset.rst',
-    'chipsec.command.rst',
-    'chipsec.defines.rst',
-    'chipsec.file.rst',
-    'chipsec.logger.rst',
-    'chipsec.module.rst',
-    'chipsec.module_common.rst',
-    'chipsec.result_deltas.rst',
-    'chipsec_main.rst',
-    'chipsec_util.rst']
 
 def RunAutoDoc() -> None:
     try:
@@ -73,13 +63,22 @@ def RunAutoDoc() -> None:
         print('Unable to run sphinx-apidoc')
         raise
 
+
 def CleanupFilesNotWantedInDoc() -> None:
-    for file in NotWantedFilesList:
-        try:
-            os.remove(os.path.join(SPHINX_MOD_DIR, file))
-        except Exception:
-            print(f'Unable to remove {file}')
-            raise
+    NotWantedFilesList = []
+    for file in os.listdir(RM_DIR):
+        with open(os.path.join(RM_DIR, file), 'r') as f:
+            NotWantedFilesList = f.read()
+        for not_needed_file in NotWantedFilesList.split(','):
+            RemoveFile(not_needed_file)
+
+
+def RemoveFile(file):
+    try:
+        os.remove(os.path.join(SPHINX_MOD_DIR, file))
+    except Exception:
+        print(f'\t\tUnable to remove {file}!!!')
+
 
 def RunScripts() -> None:
     for script in os.listdir(os.path.join(SPHINX_SCRIPTS_DIR)):
@@ -89,12 +88,14 @@ def RunScripts() -> None:
             print(f'Unable to run script: {script}')
             raise
 
+
 def GeneratePDF() -> None:
     try:
         os.system(f'sphinx-build -b pdf -T {SPHINX_DIR} {CHIPSEC_DIR}')
     except Exception:
         print('Unable to generate PDF')
         raise
+
 
 def GenerateHTML() -> None:
     try:
@@ -103,6 +104,7 @@ def GenerateHTML() -> None:
         print('Unable to generate HTML')
         raise
 
+
 def GenerateJSON() -> None:
     try:
         os.system(f'sphinx-build -b json -T {SPHINX_DIR} {os.path.join(CHIPSEC_DIR, "manualJson")}')
@@ -110,10 +112,12 @@ def GenerateJSON() -> None:
         print('Unable to generate JSON')
         raise
 
+
 format_options_functions = {
     'html': GenerateHTML,
     'json': GenerateJSON
 }
+
 
 def GenerateHTMLorJSON(option: str) -> None:
     try:
@@ -122,10 +126,12 @@ def GenerateHTMLorJSON(option: str) -> None:
         print('Invalid format option')
         raise
 
+
 def DeleteSphinxCollateral() -> None:
     shutil.rmtree(os.path.join(CHIPSEC_DIR, '.doctrees'))
     shutil.rmtree(os.path.join(SPHINX_DIR, 'logs'))
     shutil.rmtree(SPHINX_MOD_DIR)
+
 
 def main(argv: Sequence[str] = sys.argv[1:]):
     print('******************** BUILDING DOCUMENTATION **************************')
@@ -141,6 +147,7 @@ def main(argv: Sequence[str] = sys.argv[1:]):
     except Exception:
         return 1
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

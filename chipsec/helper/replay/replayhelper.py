@@ -18,11 +18,13 @@ from json import loads
 import os
 from errno import EACCES, EFAULT
 from glob import glob
+import re
+from importlib import import_module
 from typing import Any, Dict, List, Optional, Tuple
-from chipsec.defines import stringtobytes
-from chipsec.exceptions import OsHelperError
-from chipsec.file import read_file
-from chipsec.logger import logger
+from chipsec.library.defines import stringtobytes
+from chipsec.library.exceptions import OsHelperError
+from chipsec.library.file import read_file
+from chipsec.library.logger import logger
 from chipsec.helper.basehelper import Helper
 
 
@@ -62,10 +64,19 @@ class ReplayHelper(Helper):
     
     def _get_element_eval(self, cmd: str, args: Tuple) -> Optional[Any]:
         element = self._get_element(cmd, args)
+        if type(element) is str:
+            ematch = re.match(r'^!! <class \'(.*)\'>: (.*)', element)
+            if ematch:
+                eimport = ematch[1].split('.')
+                etype = getattr(import_module('.'.join(eimport[0:-1])), eimport[-1])
+                raise etype(ematch[2])
         try:
             evaledobject = eval(element)
         except Exception:
-            return None
+            try:
+                evaledobject = stringtobytes(element)
+            except Exception:
+                return None
         return evaledobject
 
     def _get_element(self, cmd: str, args: Tuple) -> Optional[Any]:
@@ -75,7 +86,12 @@ class ReplayHelper(Helper):
             targs = str(args)
         if str(cmd) in self._data:
             if targs in self._data[str(cmd)]:
-                return self._data[cmd][targs].pop()
+                try:
+                    return self._data[cmd][targs].pop()
+                except IndexError as err:
+                    logger().log_error(f'Ran out of entries for {str(cmd)} {targs}')
+                    err.args = (err.args[0] + f': {str(cmd)} {targs}',)
+                    raise err
         logger().log_error(f"Missing entry for {str(cmd)} {targs}")
         return None
     
@@ -114,10 +130,10 @@ class ReplayHelper(Helper):
         return self._get_element_eval("alloc_phys_mem", (length, max_phys_address))
 
     def free_phys_mem(self, phys_address: int) -> Optional[int]:
-        return self._get_element_eval("free_phys_mem", (phys_address))
+        return self._get_element_eval("free_phys_mem", (phys_address, ))
 
     def va2pa(self, virtual_address: int) -> Tuple[int, int]:
-        return self._get_element_eval("va2pa", (virtual_address))
+        return self._get_element_eval("va2pa", (virtual_address, ))
 
     def map_io_space(self, phys_address: int, length: int, cache_type: int) -> int:
         return self._get_element_eval("map_io_space", (phys_address, length, cache_type))
@@ -182,11 +198,12 @@ class ReplayHelper(Helper):
     #
     # ACPI
     #
-    def get_ACPI_SDT(self) -> Tuple[Optional['Array'], bool]:
-        return self._get_element_eval("get_ACPI_SDT", ())
 
     def get_ACPI_table(self, table_name: str) -> Optional['Array']:
-        return self._get_element_eval("get_ACPI_table", (table_name))
+        return self._get_element_eval("get_ACPI_table", (table_name, ))
+    
+    def enum_ACPI_tables(self) -> Optional['Array']:
+        return self._get_element_eval("enum_ACPI_tables", ())
 
     #
     # CPUID
@@ -213,7 +230,7 @@ class ReplayHelper(Helper):
         return self._get_element_eval("get_affinity", ())
 
     def set_affinity(self, value: int) -> Optional[int]:
-        return self._get_element_eval("set_affinity", (value))
+        return self._get_element_eval("set_affinity", (value, ))
 
     #
     # Logical CPU count
